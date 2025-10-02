@@ -33,6 +33,7 @@ def parse_args():
                         "Qwen/Qwen2.5-72B-Instruct", "meta-llama/Llama-3.1-8B-Instruct"], help="huggingface model name")
     parser.add_argument("--task_name", type=str, default="multivalue", choices=["NIAH", "fwe", "vt", "qa1"],                \
                         help="Test task name")
+    parser.add_argument("--use_cluster_estimation", action='store_true', help="Whether to use cluster estimation")
     args = parser.parse_args()
     
     return args
@@ -43,7 +44,8 @@ def load_model(model_name, max_len, dtype, device):
         llm = LlamaModel(model_name,
             max_length=max_len,
             dtype=dtype,
-            device_map=device)
+            device_map=device, 
+            use_cluster_estimation=args.use_cluster_estimation)
     elif 'Qwen' in model_name:
         llm = QwenModel(model_name,
             max_length=max_len,
@@ -68,13 +70,13 @@ def generate_config(model_name, context_len, attn_type):
     lower = (n_clusters // (n_segments*32)) * (n_segments*32)
     upper = lower + (n_segments*32)
     n_clusters = lower if abs(n_clusters - lower) <= abs(n_clusters - upper) else upper
-    nprobe = int(n_clusters*0.018)
+    nprobe = int(n_clusters*0.1)
 
     if attn_type == 'RetroInfer':
         original_config[attn_type]['n_centroids'] = n_clusters
         original_config[attn_type]['n_segment'] = n_segments
         original_config[attn_type]['nprobe'] = nprobe
-        original_config[attn_type]['cache_cluster_num'] = nprobe*3
+        original_config[attn_type]['cache_cluster_num'] = 0
         original_config[attn_type]['max_compute_cluster_num'] = int(n_clusters/4)
     
     if attn_type != "Full_Flash_Attn":
@@ -99,14 +101,18 @@ if __name__ == "__main__":
     if task_name == "NIAH":
         TEST_DIR = os.path.join(PROJECT_ROOT, "throughput_eval")
         TEST_FILE = os.path.join(TEST_DIR, f"test_data/NIAH_{args.context_len}.json")
-        data = json.load(open(TEST_FILE))[0]
+        # data = json.load(open(TEST_FILE))[0]
+        with open(TEST_FILE, "r") as f:
+            data = json.load(f)[0]
         prompt = data['input']
         groundtruth = data['answer']
         attn_config = generate_config(model_name, args.context_len, attn_type)
     else:
         TEST_DIR = os.path.join(PROJECT_ROOT, "throughput_eval")
         TEST_FILE = os.path.join(TEST_DIR, f"test_data/{task_name}.json")
-        data = json.load(open(TEST_FILE))
+        # data = json.load(open(TEST_FILE))[0]
+        with open(TEST_FILE, "r") as f:
+            data = json.load(f)[0]
         prompt = data['input']
         groundtruth = data['outputs']
         attn_config = generate_config(model_name, 120000, attn_type)
@@ -120,7 +126,7 @@ if __name__ == "__main__":
     attention_masks = inputs.attention_mask
 
     input_len = input_ids.shape[1]
-    gen_len = 100
+    gen_len = 256
     max_len = input_len + gen_len
     print(colored(f"Input length: {input_len}", 'yellow'))
 

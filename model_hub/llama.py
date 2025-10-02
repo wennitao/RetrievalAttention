@@ -28,6 +28,8 @@ class LlamaLayer:
         self.wqkv = torch.cat((self.wq, self.wk, self.wv), dim=0).to(self.device, non_blocking=True)
         self.wo = hf_llama_layer.self_attn.o_proj.weight.detach().to(self.device, non_blocking=True)
 
+        self.wq_next = None
+
         self.gate_proj = hf_llama_layer.mlp.gate_proj.weight.detach()
         self.up_proj = hf_llama_layer.mlp.up_proj.weight.detach()
         self.gate_up_proj = torch.cat((self.gate_proj, self.up_proj), dim=0).to(self.device, non_blocking=True)
@@ -41,6 +43,9 @@ class LlamaLayer:
 
         del self.wq, self.wk, self.wv, self.gate_proj, self.up_proj
 
+    def init_wq_next (self, wq_next):
+        self.wq_next = wq_next.to(self.device, non_blocking=True)
+
 
 class LlamaModel(LLM):
     """
@@ -52,7 +57,8 @@ class LlamaModel(LLM):
         model_name: str,
         max_length: int,
         dtype: torch.dtype,
-        device_map: str
+        device_map: str,
+        use_cluster_estimation: bool = False
     ) -> None:
         super().__init__(model_name, max_length, dtype, device_map)
 
@@ -67,6 +73,7 @@ class LlamaModel(LLM):
         self.max_position_embeddings = self.config.max_position_embeddings
         self.vocab_size = self.config.vocab_size
         self.eos_tokens = [self.config.eos_token_id]
+        self.use_cluster_estimation = use_cluster_estimation
 
         self.init_model()
 
@@ -105,6 +112,11 @@ class LlamaModel(LLM):
             for idx, hf_llama_layer in enumerate(hf_llama.model.layers):
                 llama_layer = LlamaLayer(idx, device=self.device_map)
                 llama_layer.init_layer(hf_llama_layer)
+
+                if self.use_cluster_estimation and idx < self.num_layers - 1:
+                    wq_next = hf_llama.model.layers[idx + 1].self_attn.q_proj.weight.detach()
+                    llama_layer.init_wq_next(wq_next)
+
                 self.layers.append(llama_layer)
                 hf_llama.model.layers[idx] = None
 
@@ -191,7 +203,8 @@ class LlamaModel(LLM):
                 cache_unit_size = retroinfer_config["cache_unit_size"],
                 cache_cluster_num = retroinfer_config["cache_cluster_num"],
                 num_gpus = self.num_gpus,
-                model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1))
+                model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)), 
+                use_cluster_estimation = self.use_cluster_estimation
             )
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
@@ -221,6 +234,9 @@ class LlamaModel(LLM):
         query_states, key_states, value_states = qkv.split([self.hidden_size, self.hidden_size//self.num_key_value_groups, self.hidden_size//self.num_key_value_groups], dim=-1)
         return query_states, key_states, value_states
 
+    def wq_next(self, hidden_states, layer):
+        query_states_next = F.linear(hidden_states, layer.wq_next)
+        return query_states_next
     
     def wo(self, hidden_states, layer, bsz, seq_len, dim):
         hidden_states = hidden_states.reshape(bsz, seq_len, dim)
@@ -238,11 +254,11 @@ class LlamaModel(LLM):
         return attn_out
     
 
-    def decode_attention(self, query_states, key_states, value_states, layer_idx):
+    def decode_attention(self, query_states, key_states, value_states, layer_idx, query_states_next=None):
         if self.attention_type == 'Full_Flash_Attn':
             attn_out = decode_full_flash_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'RetroInfer':
-            attn_out = retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
+            attn_out = retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache, query_states_next)
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
         return attn_out
@@ -303,6 +319,13 @@ class LlamaModel(LLM):
         key_states = key_states.view(bsz, -1, kv_dim)
         return query_states, key_states
 
+    def apply_rotary_pos_emb_query(self, query_states, position_ids):
+        bsz, _, hidden_dim = query_states.shape
+        query_states = query_states.view(-1, hidden_dim)
+        key_states_temp = torch.zeros_like(query_states)
+        flashinfer.rope.apply_rope_with_cos_sin_cache_inplace(position_ids, query_states, key_states_temp, self.head_dim, self.cos_sin_cache, False)
+        query_states = query_states.view(bsz, -1, hidden_dim)
+        return query_states
 
     def position_embedd(self, query_states, key_states):
         bsz, seq_len, _ = key_states.shape
@@ -313,4 +336,11 @@ class LlamaModel(LLM):
 
         return query_states, key_states
 
-    
+    def position_embedd_next_query(self, query_states):
+        bsz, seq_len, _ = query_states.shape
+
+        position_ids = self.position_ids[self.kv_cache.context:self.kv_cache.context+seq_len].unsqueeze(0).repeat(bsz, 1)
+
+        query_states = self.apply_rotary_pos_emb_query(query_states, position_ids)
+
+        return query_states

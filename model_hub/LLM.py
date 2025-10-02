@@ -99,12 +99,22 @@ class LLM:
         query_states, key_states, value_states = self.wqkv(hidden_states, layer)
         query_states, key_states = self.position_embedd(query_states, key_states)
 
+        estimate_next_query = self.use_cluster_estimation and layer_idx > 1 and layer.wq_next is not None
+        if estimate_next_query:
+            query_states_next = self.wq_next(hidden_states, layer)
+            query_states_next = self.position_embedd_next_query(query_states_next)
+        else:
+            query_states_next = None
+
         query_states = query_states.view(bsz, -1, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, -1, self.num_key_value_heads, self.head_dim)
 
+        if estimate_next_query:
+            query_states_next = query_states_next.view(bsz, -1, self.num_heads, self.head_dim)
+
         key_states, value_states = self.kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
-        attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx)
+        attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx, query_states_next)
         hidden_states = self.wo(attn_out, layer, bsz, seq_len, dim)
         hidden_states = residual + hidden_states
 

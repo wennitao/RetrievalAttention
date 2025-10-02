@@ -14,10 +14,11 @@ def retroinfer_prefill_attn(query_states, key_states, value_states, causal):
 
 
 
-def retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, retroinfer_cache):
+def retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, retroinfer_cache, query_states_next=None):
     
     attn_out = retroinfer_cache.compute(
-        query_states.contiguous(), layer_idx
+        query_states.contiguous(), layer_idx, 
+        query_states_next.contiguous() if query_states_next is not None else None,
     )
     
     return attn_out
