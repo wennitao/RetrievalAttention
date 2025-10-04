@@ -796,15 +796,16 @@ public:
         pool_->AddNumTask(num_threads);
         pool_->UnlockQueue();
         pool_->NotifyAll();
-        pool_->Wait();
+        return;
+    }
 
-        // submit aysnc update tasks
+    void para_batch_update() {
+        // submit async update tasks
         pool_->LockQueue();
         pool_->QueueJobWOLock([this](void* para) { return this->para_batch_updata(); }, nullptr);
         pool_->AddNumTask(1);
         pool_->UnlockQueue();
         pool_->NotifyAll();
-        
         return;
     }
 
@@ -838,6 +839,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("update_kv", &WaveBufferCPU::update_kv, 
             py::arg("update_keys"), py::arg("update_values"), py::arg("clusters"), py::arg("cluster_size"))
         .def("batch_access", &WaveBufferCPU::para_batch_access)
+        .def("batch_update", &WaveBufferCPU::para_batch_update)
         .def("sync", &WaveBufferCPU::sync);
     
     py::class_<MyThreadPool>(m, "MyThreadPool")

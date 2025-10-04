@@ -128,6 +128,10 @@ void MyThreadPool::Stop() {
         active_thread.join();
     }
     threads.clear();
+    // Clear any remaining jobs to avoid dangling function objects
+    while (!jobs.empty()) {
+        jobs.pop();
+    }
 }
 
 // Wait until all submitted tasks have been executed

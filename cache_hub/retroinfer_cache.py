@@ -578,6 +578,12 @@ class retroinfer_cache(KV_Cache):
             # print (f"layer {layer_idx} select clusters: {(end-start) * 1000:.4f} ms")
             torch.cuda.nvtx.range_pop()
 
+        # cache access and submit cache update tasks to thread pool
+        if layer_idx < 2 or not self.use_cluster_estimation:
+            torch.cuda.nvtx.range_push("current_layer_access")
+            self.wave_buffer[layer_idx].batch_access()
+            torch.cuda.nvtx.range_pop()
+
         # estimate next layer clusters
         if self.use_cluster_estimation and layer_idx > 0 and layer_idx < self.layer_num - 1 and queries_next is not None:
             torch.cuda.nvtx.range_push("search_next_topk_clusters")
@@ -593,6 +599,17 @@ class retroinfer_cache(KV_Cache):
             # end = time.perf_counter()
             # print (f"layer {layer_idx + 1} estimate clusters: {(end-start) * 1000:.4f} ms")
             torch.cuda.nvtx.range_pop()
+
+        # cache access and submit cache update tasks to thread pool
+        # no estimated clusters
+        # start = time.perf_counter()
+        # estimated clusters
+        if self.use_cluster_estimation and layer_idx > 1 and layer_idx < self.layer_num - 1 and queries_next is not None:
+            torch.cuda.nvtx.range_push("next_layer_access")
+            self.wave_buffer[layer_idx + 1].batch_access()
+            torch.cuda.nvtx.range_pop()
+        # end = time.perf_counter()
+        # print (f"layer {layer_idx} wave_buffer access time: {(end-start) * 1000:.4f} ms")
 
         # estimation zone computation
         if self.es_cluster_num > 0:
@@ -622,23 +639,24 @@ class retroinfer_cache(KV_Cache):
             torch.cuda.nvtx.range_pop()
         else:
             es_out, es_lse = None, None
-        
-        # cache access and submit cache update tasks to thread pool
-        # no estimated clusters
-        # start = time.perf_counter()
+
+        # no estimation, current layer access sync
         if layer_idx < 2 or not self.use_cluster_estimation:
-            self.wave_buffer[layer_idx].batch_access()
-        # estimated clusters
-        if self.use_cluster_estimation and layer_idx > 0 and layer_idx < self.layer_num - 1 and queries_next is not None:
-            self.wave_buffer[layer_idx + 1].batch_access()
-        # end = time.perf_counter()
-        # print (f"layer {layer_idx} wave_buffer access time: {(end-start) * 1000:.4f} ms")
+            self.wave_buffer[layer_idx].sync()
+            self.wave_buffer[layer_idx].batch_update()
+        # estimation, next layer access sync
+        if self.use_cluster_estimation and layer_idx > 1 and layer_idx < self.layer_num - 1:
+            self.wave_buffer[layer_idx + 1].sync()
+            self.wave_buffer[layer_idx].batch_update()
 
         # assemble the execution buffer
-        torch.cuda.nvtx.range_push("gather_copy_and_concat")
         # start = time.perf_counter()
-        if layer_idx < 2 or not self.use_cluster_estimation:   
+        # current layer copy
+        if layer_idx < 2 or not self.use_cluster_estimation:
             # print (self.list_keys[layer_idx].device, self.cache_keys[layer_idx].device, self.execution_buffer_keys.device)
+            # print ("hit ", torch.sum (self.hit_unit_sizes[layer_idx], dim=1))
+            # print ("miss ", torch.sum (self.miss_unit_sizes[layer_idx], dim=1))
+            torch.cuda.nvtx.range_push("current_layer_copy")
             gather_copy_and_concat(self.steady_zone_keys[layer_idx], self.list_keys[layer_idx], self.cache_keys[layer_idx], self.execution_buffer_keys[buffer_idx],
                                 self.steady_zone_values[layer_idx], self.list_values[layer_idx], self.cache_values[layer_idx], self.execution_buffer_values[buffer_idx],
                                 self.miss_unit_idices[layer_idx], self.miss_unit_sizes[layer_idx], self.miss_unit_sizes_cumsum[layer_idx], self.miss_num_units[layer_idx],
@@ -646,7 +664,10 @@ class retroinfer_cache(KV_Cache):
                                 self.valid_lengths[buffer_idx], self.batch_groups, 
                                 self.static_stride, self.list_stride, self.cache_stride,
                                 self.execution_stride, self.buffer_size, static_len)
-        if self.use_cluster_estimation and layer_idx > 0 and layer_idx < self.layer_num - 1 and queries_next is not None:
+            torch.cuda.nvtx.range_pop()
+        # next layer copy
+        if self.use_cluster_estimation and layer_idx > 1 and layer_idx < self.layer_num - 1 and queries_next is not None:
+            torch.cuda.nvtx.range_push("next_layer_copy")
             with torch.cuda.stream(self.copystream):
                 gather_copy_and_concat(self.steady_zone_keys[layer_idx + 1], self.list_keys[layer_idx + 1], self.cache_keys[layer_idx + 1], self.execution_buffer_keys[next_buffer_idx],
                                     self.steady_zone_values[layer_idx + 1], self.list_values[layer_idx + 1], self.cache_values[layer_idx + 1], self.execution_buffer_values[next_buffer_idx],
@@ -655,10 +676,15 @@ class retroinfer_cache(KV_Cache):
                                     self.valid_lengths[next_buffer_idx], self.batch_groups, 
                                     self.static_stride, self.list_stride, self.cache_stride,
                                     self.execution_stride, self.buffer_size, static_len)
+            torch.cuda.nvtx.range_pop()
         # torch.cuda.synchronize()
         # end = time.perf_counter()
         # print (f"gather_copy_and_concat time: {(end-start) * 1000:.4f} ms")
-        torch.cuda.nvtx.range_pop()
+
+        if self.use_cluster_estimation and layer_idx == 1:
+            torch.cuda.nvtx.range_push("next_layer_access")
+            self.wave_buffer[layer_idx + 1].batch_access()
+            torch.cuda.nvtx.range_pop()
 
         # flash attention for retrieve zone and steady zone, merge the estimation zone results at the same time
         torch.cuda.nvtx.range_push("flash_attention")
@@ -679,18 +705,33 @@ class retroinfer_cache(KV_Cache):
 
         # admiss pages from execution buffer to GPU cache
         # start = time.perf_counter()
+        # update sync
         self.wave_buffer[layer_idx].sync()  # wait for update LRU finish
         # end = time.perf_counter()
         # print (f"layer {layer_idx} wave_buffer sync time: {(end-start) * 1000:.4f} ms")
 
         # start = time.perf_counter()
-        gather_copy_and_scatter(self.execution_buffer_keys[buffer_idx], self.cache_keys[layer_idx], self.execution_buffer_values[buffer_idx], self.cache_values[layer_idx],
-                                self.update_buffer_indices[layer_idx], self.update_unit_sizes[layer_idx], self.update_cache_indices[layer_idx], 
-                                self.update_num_units[layer_idx], self.batch_groups, self.execution_stride, self.cache_stride,
-                                self.buffer_size, static_len)
+        with torch.cuda.stream(self.copystream):
+            gather_copy_and_scatter(self.execution_buffer_keys[buffer_idx], self.cache_keys[layer_idx], self.execution_buffer_values[buffer_idx], self.cache_values[layer_idx],
+                                    self.update_buffer_indices[layer_idx], self.update_unit_sizes[layer_idx], self.update_cache_indices[layer_idx], 
+                                    self.update_num_units[layer_idx], self.batch_groups, self.execution_stride, self.cache_stride,
+                                    self.buffer_size, static_len)
         # torch.cuda.synchronize()
         # end = time.perf_counter()
         # print (f"gather copy and scatter {(end-start) * 1000:.4f} ms")
+
+        # layer 1 access and copy
+        if self.use_cluster_estimation and layer_idx == 1:
+            self.wave_buffer[layer_idx + 1].sync()
+
+            with torch.cuda.stream(self.copystream):
+                gather_copy_and_concat(self.steady_zone_keys[layer_idx + 1], self.list_keys[layer_idx + 1], self.cache_keys[layer_idx + 1], self.execution_buffer_keys[next_buffer_idx],
+                                    self.steady_zone_values[layer_idx + 1], self.list_values[layer_idx + 1], self.cache_values[layer_idx + 1], self.execution_buffer_values[next_buffer_idx],
+                                    self.miss_unit_idices[layer_idx + 1], self.miss_unit_sizes[layer_idx + 1], self.miss_unit_sizes_cumsum[layer_idx + 1], self.miss_num_units[layer_idx + 1],
+                                    self.hit_unit_idices[layer_idx + 1], self.hit_unit_sizes[layer_idx + 1], self.hit_unit_sizes_cumsum[layer_idx + 1], self.hit_num_units[layer_idx + 1],
+                                    self.valid_lengths[next_buffer_idx], self.batch_groups, 
+                                    self.static_stride, self.list_stride, self.cache_stride,
+                                    self.execution_stride, self.buffer_size, static_len)
 
         torch.cuda.nvtx.range_pop()
 

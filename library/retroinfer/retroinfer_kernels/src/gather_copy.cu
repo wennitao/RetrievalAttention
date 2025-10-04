@@ -10,7 +10,7 @@
 
 #define CHUNK_SIZE 8        // number of vectors for one chunk
 #define DATA_BYTES 2        // input data type, 2 use bf16/fp16, 4 use fp32
-#define PTYPE int2          // int4 for 16 Bytes, int2 for 8 Bytes
+#define PTYPE int4          // int4 for 16 Bytes, int2 for 8 Bytes
 
 #if DATA_BYTES == 4
 #define MYTPE uint32_t
@@ -298,6 +298,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::arg("data_offsets3"), py::arg("data_copy_sizes3"), py::arg("buffer_offsets3"), py::arg("copy_chunks3"),
     py::arg("valid_lengths"), py::arg("groups"), py::arg("data_length1"), py::arg("data_length2"), py::arg("data_length3"), 
     py::arg("buffer_length"), py::arg("offset_length"), py::arg("copy_vectors1")),
+
+    // m.def("gather_copy_and_concat", &gather_copy_and_concat, "Gather copy and concat from different sources (CUDA)"), 
 
     m.def("gather_copy_and_scatter", &gather_copy_and_scatter, "Gather copy from src and scatter to dst (CUDA)",
     py::arg("key_data"), py::arg("key_buffer"), py::arg("value_data"), py::arg("value_buffer"),

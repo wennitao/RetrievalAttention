@@ -118,10 +118,12 @@ class LLM:
         hidden_states = self.wo(attn_out, layer, bsz, seq_len, dim)
         hidden_states = residual + hidden_states
 
+        torch.cuda.nvtx.range_push("mlp")
         residual = hidden_states
         hidden_states = self.layernorm(hidden_states, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
         hidden_states = self.mlp(hidden_states, layer)
         hidden_states = residual + hidden_states
+        torch.cuda.nvtx.range_pop()
 
         return hidden_states
 
