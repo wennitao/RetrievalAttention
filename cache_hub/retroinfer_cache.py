@@ -8,6 +8,10 @@ from .kmeans import segment_k_means
 from weighted_flash_decoding import weighted_flash_decoding
 
 import time
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.decomposition import PCA
 
 # update segment size
 THRESHOLD_LENGTH = 1024
@@ -285,7 +289,339 @@ class retroinfer_cache(KV_Cache):
             with torch.cuda.device(device_idx):
                 self.mainevents[device_idx] = torch.cuda.Event()
                 self.copyevents[device_idx] = torch.cuda.Event()
-    
+
+        # statistics tracking for cache hit/miss
+        self.cache_stats = {
+            'total_hits': [0] * self.layer_num,
+            'total_misses': [0] * self.layer_num,
+            'total_accesses': [0] * self.layer_num
+        }
+
+        # statistics tracking for cluster overlap between consecutive decoding steps
+        self.cluster_overlap_stats = {
+            'total_overlap': [0] * self.layer_num,
+            'total_clusters': [0] * self.layer_num,
+            'num_samples': [0] * self.layer_num
+        }
+
+        # store previous cluster indices for overlap calculation - one per layer
+        self.prev_cluster_ids = [
+            torch.empty((self.batch_size*self.kv_head, self.nprobe), dtype=torch.int64, pin_memory=True).contiguous()
+            for _ in range(self.layer_num)
+        ]
+        self.prev_cluster_valid = [False] * self.layer_num  # track if previous clusters are valid for each layer
+
+        # Visualization settings
+        self.enable_prefill_visualization = False
+        self.viz_save_dir = "plots/prefill_clusters"
+
+        # Store queries from decoding steps for visualization
+        self.decode_queries = [[] for _ in range(self.layer_num)]  # List of queries per layer
+        self.max_decode_steps_to_visualize = 50  # Limit number of decode steps to store
+
+        # Statistics for query similarity between decoding steps
+        self.query_similarity_stats = {
+            'cosine_similarities': [[] for _ in range(self.layer_num)],
+            'l2_distances': [[] for _ in range(self.layer_num)]
+        }
+
+        # Statistics for cluster overlap when using previous query
+        self.prev_query_cluster_overlap_stats = {
+            'total_overlap': [0] * self.layer_num,
+            'total_clusters': [0] * self.layer_num,
+            'num_samples': [0] * self.layer_num
+        }
+
+        # Store previous queries (as tensors) for cluster selection simulation
+        self.prev_queries = [None] * self.layer_num
+
+    def enable_visualization(self, save_dir="plots/prefill_clusters"):
+        """Enable visualization of key values and centroids during prefill."""
+        self.enable_prefill_visualization = True
+        self.viz_save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"Prefill visualization enabled. Plots will be saved to: {save_dir}")
+
+    def plot_query_similarity(self, layer_indices=None):
+        """
+        Plot query similarity statistics across decoding steps.
+
+        Args:
+            layer_indices: list of layer indices to visualize (default: all layers)
+        """
+        if layer_indices is None:
+            layer_indices = range(self.layer_num)
+
+        fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+        # Plot 1: Cosine similarity over time for selected layers
+        ax = axes[0, 0]
+        for layer_idx in layer_indices:
+            cosine_sims = self.query_similarity_stats['cosine_similarities'][layer_idx]
+            if len(cosine_sims) > 0:
+                ax.plot(range(len(cosine_sims)), cosine_sims, marker='o',
+                       markersize=3, alpha=0.7, label=f'Layer {layer_idx}')
+        ax.set_xlabel('Decoding Step')
+        ax.set_ylabel('Cosine Similarity')
+        ax.set_title('Query Cosine Similarity Between Consecutive Steps')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # Plot 2: L2 distance over time for selected layers
+        ax = axes[0, 1]
+        for layer_idx in layer_indices:
+            l2_dists = self.query_similarity_stats['l2_distances'][layer_idx]
+            if len(l2_dists) > 0:
+                ax.plot(range(len(l2_dists)), l2_dists, marker='o',
+                       markersize=3, alpha=0.7, label=f'Layer {layer_idx}')
+        ax.set_xlabel('Decoding Step')
+        ax.set_ylabel('L2 Distance')
+        ax.set_title('Query L2 Distance Between Consecutive Steps')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # Plot 3: Average cosine similarity per layer
+        ax = axes[1, 0]
+        avg_cosine_per_layer = []
+        for ldx in range(self.layer_num):
+            cosine_sims = self.query_similarity_stats['cosine_similarities'][ldx]
+            avg_cosine_per_layer.append(np.mean(cosine_sims) if len(cosine_sims) > 0 else 0)
+        ax.bar(range(self.layer_num), avg_cosine_per_layer, color='skyblue', edgecolor='navy')
+        ax.set_xlabel('Layer Index')
+        ax.set_ylabel('Average Cosine Similarity')
+        ax.set_title('Average Query Cosine Similarity per Layer')
+        ax.grid(True, alpha=0.3, axis='y')
+
+        # Plot 4: Average L2 distance per layer
+        ax = axes[1, 1]
+        avg_l2_per_layer = []
+        for ldx in range(self.layer_num):
+            l2_dists = self.query_similarity_stats['l2_distances'][ldx]
+            avg_l2_per_layer.append(np.mean(l2_dists) if len(l2_dists) > 0 else 0)
+        ax.bar(range(self.layer_num), avg_l2_per_layer, color='lightcoral', edgecolor='darkred')
+        ax.set_xlabel('Layer Index')
+        ax.set_ylabel('Average L2 Distance')
+        ax.set_title('Average Query L2 Distance per Layer')
+        ax.grid(True, alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        filename = 'query_similarity_stats.png'
+        plt.savefig(os.path.join(self.viz_save_dir, filename), dpi=150, bbox_inches='tight')
+        plt.close()
+
+        print(f"Saved query similarity visualization: {filename}")
+
+    def generate_all_visualizations(self, batch_idx=0, head_idx=0, layer_indices=None):
+        """
+        Generate all visualizations after decoding is complete.
+        This includes queries from decoding steps and query similarity plots.
+
+        Args:
+            batch_idx: which batch to visualize (default 0)
+            head_idx: which attention head to visualize (default 0)
+            layer_indices: list of layer indices to visualize (default: all layers)
+        """
+        if not self.enable_prefill_visualization:
+            print("Visualization is not enabled. Call enable_visualization() first.")
+            return
+
+        if layer_indices is None:
+            layer_indices = range(self.layer_num)
+
+        print(f"\nGenerating visualizations for {len(layer_indices)} layers...")
+
+        for layer_idx in layer_indices:
+            num_queries = len(self.decode_queries[layer_idx])
+            print(f"Layer {layer_idx}: {num_queries} decode queries captured")
+            self.plot_layer_clusters(layer_idx, batch_idx, head_idx)
+
+        self.plot_all_layers_summary(batch_idx)
+        self.plot_query_similarity(layer_indices)
+
+        # Print query similarity statistics
+        self.print_query_similarity_stats()
+
+        print(f"\nAll visualizations saved to: {self.viz_save_dir}")
+
+    def plot_layer_clusters(self, layer_idx, batch_idx=0, head_idx=0):
+        """
+        Visualize key values and their centroids for a specific layer after prefill.
+        Also plots decode queries if available.
+
+        Args:
+            layer_idx: which layer to visualize
+            batch_idx: which batch to visualize (default 0)
+            head_idx: which attention head to visualize (default 0)
+        """
+        if not self.enable_prefill_visualization:
+            return
+
+        with torch.no_grad():
+            # Get centroids for this layer and head
+            centroids = self.centroids[layer_idx][batch_idx*self.kv_head + head_idx].cpu().numpy()  # [n_centroids, head_dim]
+            cluster_size = self.cluster_size[layer_idx][batch_idx*self.kv_head + head_idx].cpu().numpy()  # [n_centroids]
+
+            # Get key values for this layer and head
+            keys = self.list_keys[layer_idx][batch_idx, head_idx].cpu().numpy()  # [num_tokens, head_dim]
+
+            # Get decode queries if available
+            queries_list = self.decode_queries[layer_idx]
+            has_queries = len(queries_list) > 0
+
+            # Filter out empty clusters
+            valid_mask = cluster_size > 0
+            valid_centroids = centroids[valid_mask]
+            valid_sizes = cluster_size[valid_mask]
+
+            # Use PCA to reduce to 2D
+            pca = PCA(n_components=2)
+            all_data = [keys, valid_centroids]
+            if has_queries:
+                queries = np.vstack(queries_list)  # [num_decode_steps, head_dim]
+                all_data.append(queries)
+
+            all_data_combined = np.vstack(all_data)
+            reduced_all = pca.fit_transform(all_data_combined)
+
+            keys_2d = reduced_all[:len(keys)]
+            centroids_2d = reduced_all[len(keys):len(keys)+len(valid_centroids)]
+            if has_queries:
+                queries_2d = reduced_all[len(keys)+len(valid_centroids):]
+
+            # Create visualization
+            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+            # Plot 1: Keys, Centroids, and Decode Queries
+            ax = axes[0]
+            ax.scatter(keys_2d[:, 0], keys_2d[:, 1], alpha=0.3, s=10, c='lightblue', label='Key Vectors')
+            scatter = ax.scatter(centroids_2d[:, 0], centroids_2d[:, 1],
+                               s=valid_sizes * 3, c=valid_sizes, cmap='viridis',
+                               alpha=0.7, edgecolors='red', linewidth=2, label='Centroids')
+
+            # Plot decode queries as a trajectory
+            if has_queries:
+                ax.plot(queries_2d[:, 0], queries_2d[:, 1], 'o-', color='orange',
+                       markersize=6, linewidth=1.5, alpha=0.8, label='Decode Queries')
+                # Add step numbers
+                for i, (x, y) in enumerate(queries_2d[::max(1, len(queries_2d)//10)]):  # Label every 10th or fewer
+                    ax.annotate(str(i), (x, y), fontsize=8, color='darkred',
+                              xytext=(3, 3), textcoords='offset points')
+
+            cbar = plt.colorbar(scatter, ax=ax)
+            cbar.set_label('Cluster Size', rotation=270, labelpad=20)
+            ax.set_xlabel('PCA Component 1')
+            ax.set_ylabel('PCA Component 2')
+            title = f'Layer {layer_idx} Head {head_idx}: Keys & Centroids'
+            if has_queries:
+                title += f' + {len(queries_list)} Decode Queries'
+            title += f'\n({len(keys)} keys, {valid_mask.sum()}/{len(centroids)} non-empty clusters)'
+            ax.set_title(title)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            # Plot 2: Cluster size distribution
+            ax = axes[1]
+            ax.hist(valid_sizes, bins=30, color='skyblue', edgecolor='navy', alpha=0.7)
+            ax.axvline(valid_sizes.mean(), color='red', linestyle='--', linewidth=2,
+                      label=f'Mean: {valid_sizes.mean():.1f}')
+            ax.set_xlabel('Cluster Size')
+            ax.set_ylabel('Frequency')
+            ax.set_title(f'Layer {layer_idx} Head {head_idx}: Cluster Size Distribution\n'
+                        f'Total clusters: {len(valid_sizes)}, Total keys: {valid_sizes.sum():.0f}')
+            ax.legend()
+            ax.grid(True, alpha=0.3, axis='y')
+
+            plt.tight_layout()
+            filename = f'layer_{layer_idx}_batch_{batch_idx}_head_{head_idx}.png'
+            plt.savefig(os.path.join(self.viz_save_dir, filename), dpi=150, bbox_inches='tight')
+            plt.close()
+
+            print(f"Saved visualization: {filename}")
+
+    def plot_all_layers_summary(self, batch_idx=0):
+        """
+        Create summary plots showing cluster statistics across all layers.
+
+        Args:
+            batch_idx: which batch to visualize (default 0)
+        """
+        if not self.enable_prefill_visualization:
+            return
+
+        with torch.no_grad():
+            # Collect statistics for all layers
+            avg_cluster_sizes = []
+            num_empty_clusters = []
+            num_valid_clusters = []
+
+            for layer_idx in range(self.layer_num):
+                cluster_size = self.cluster_size[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head].cpu().numpy()
+
+                # Average across all heads
+                valid_sizes = cluster_size[cluster_size > 0]
+                avg_cluster_sizes.append(valid_sizes.mean() if len(valid_sizes) > 0 else 0)
+                num_empty_clusters.append((cluster_size == 0).sum())
+                num_valid_clusters.append((cluster_size > 0).sum())
+
+            # Create subplots
+            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+            # Plot 1: Average cluster size per layer
+            ax = axes[0, 0]
+            ax.bar(range(self.layer_num), avg_cluster_sizes, color='skyblue', edgecolor='navy')
+            ax.set_xlabel('Layer Index')
+            ax.set_ylabel('Average Cluster Size')
+            ax.set_title('Average Cluster Size per Layer')
+            ax.grid(True, alpha=0.3, axis='y')
+
+            # Plot 2: Valid vs empty clusters
+            ax = axes[0, 1]
+            width = 0.35
+            x = np.arange(self.layer_num)
+            ax.bar(x - width/2, num_valid_clusters, width, label='Valid', color='green', alpha=0.7)
+            ax.bar(x + width/2, num_empty_clusters, width, label='Empty', color='red', alpha=0.7)
+            ax.set_xlabel('Layer Index')
+            ax.set_ylabel('Number of Clusters')
+            ax.set_title('Valid vs Empty Clusters per Layer')
+            ax.legend()
+            ax.grid(True, alpha=0.3, axis='y')
+
+            # Plot 3: Heatmap of cluster sizes
+            ax = axes[1, 0]
+            cluster_data = []
+            for layer_idx in range(self.layer_num):
+                cluster_size = self.cluster_size[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head].cpu().numpy()
+                cluster_data.append(cluster_size.mean(axis=0))  # Average across heads
+
+            cluster_data = np.array(cluster_data)
+            im = ax.imshow(cluster_data, aspect='auto', cmap='YlOrRd', interpolation='nearest')
+            ax.set_xlabel('Centroid Index')
+            ax.set_ylabel('Layer Index')
+            ax.set_title(f'Cluster Size Heatmap Across Layers\n(averaged across {self.kv_head} heads)')
+            cbar = plt.colorbar(im, ax=ax)
+            cbar.set_label('Cluster Size', rotation=270, labelpad=20)
+
+            # Plot 4: Cluster size variance across layers
+            ax = axes[1, 1]
+            variances = []
+            for layer_idx in range(self.layer_num):
+                cluster_size = self.cluster_size[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head].cpu().numpy()
+                valid_sizes = cluster_size[cluster_size > 0]
+                variances.append(valid_sizes.std() if len(valid_sizes) > 0 else 0)
+
+            ax.plot(range(self.layer_num), variances, marker='o', linewidth=2, markersize=8, color='purple')
+            ax.set_xlabel('Layer Index')
+            ax.set_ylabel('Cluster Size Std Dev')
+            ax.set_title('Cluster Size Variance per Layer')
+            ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            filename = f'all_layers_summary_batch_{batch_idx}.png'
+            plt.savefig(os.path.join(self.viz_save_dir, filename), dpi=150, bbox_inches='tight')
+            plt.close()
+
+            print(f"Saved summary visualization: {filename}")
+
     # decide whether to pre-allocate GPU memory before prefilling
     def pre_allocate_decision(self):
         # estimate the KV Cache GPU memory consumption
@@ -337,6 +673,7 @@ class retroinfer_cache(KV_Cache):
         # sync the last batch of the last layer
         torch.cuda.synchronize()
         self.wave_buffer[self.layer_num-1].construction_sync()
+
         # clear temp memory
         self.clusters_cpu = None
         self.cluster_size_cpu = None
@@ -444,7 +781,7 @@ class retroinfer_cache(KV_Cache):
         self,
         layer_idx,
         batch_idx
-    ):  
+    ):
         """
         wait async offloading on copystream -> organize kv
         """
@@ -546,6 +883,402 @@ class retroinfer_cache(KV_Cache):
         return None, None   # no use the return value
     
 
+    def update_cache_stats(self, layer_idx):
+        """
+        Update cache hit/miss statistics for a specific layer
+        """
+        # Sum up hits and misses across all batch groups
+        total_hits = torch.sum(self.hit_num_units[layer_idx]).item()
+        total_misses = torch.sum(self.miss_num_units[layer_idx]).item()
+
+        self.cache_stats['total_hits'][layer_idx] += total_hits
+        self.cache_stats['total_misses'][layer_idx] += total_misses
+        self.cache_stats['total_accesses'][layer_idx] += total_hits + total_misses
+
+    def update_prev_query_cluster_overlap_stats(self, layer_idx, buffer_idx):
+        """
+        Calculate cluster overlap if we used the previous query instead of current query.
+        This shows how many clusters would overlap if we reused the previous query.
+
+        Args:
+            layer_idx: current layer index
+            buffer_idx: buffer index for current layer
+        """
+        with torch.no_grad():
+            # Use previous query to select clusters
+            prev_query = self.prev_queries[layer_idx]
+
+            # Calculate distances with previous query
+            batch_gemm_softmax(prev_query, self.centroids[layer_idx], self.gemm_o, self.norm, self.sum, self.softmax_o,
+                            self.batch_groups, self.group_size, self.n_centroids, self.head_dim,
+                            self.RSQRT_DIM, 0)
+            dist_prev = torch.sum(self.softmax_o, dim=1)  # [batch_size*group_num, n_centroids]
+            dist_prev.masked_fill_(self.centroids_mask[layer_idx], self.DTYPE_MIN)
+
+            # Get top-k clusters using previous query
+            prev_query_cluster_ids = torch.topk(dist_prev, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True)[1]
+
+            # Compare with actual clusters selected by current query
+            # current_cluster_ids = self.cluster_ids[buffer_idx]
+            current_cluster_ids = self.cI[buffer_idx]
+
+            # Calculate overlap
+            total_overlap = 0
+            for i in range(self.batch_size * self.kv_head):
+                current_set = set(current_cluster_ids[i].cpu().tolist())
+                prev_query_set = set(prev_query_cluster_ids[i].cpu().tolist())
+                overlap = len(current_set & prev_query_set)
+                total_overlap += overlap
+
+            self.prev_query_cluster_overlap_stats['total_overlap'][layer_idx] += total_overlap
+            self.prev_query_cluster_overlap_stats['total_clusters'][layer_idx] += self.batch_size * self.kv_head * self.max_compute_cluster_num
+            self.prev_query_cluster_overlap_stats['num_samples'][layer_idx] += 1
+
+    def update_cluster_overlap_stats(self, layer_idx):
+        """
+        Update cluster overlap statistics by comparing current cluster indices
+        with previous decoding step for a specific layer
+        """
+        buffer_idx = layer_idx % 2
+
+        # Only calculate overlap if we have valid previous clusters for this layer
+        if self.prev_cluster_valid[layer_idx]:
+            # Calculate overlap for each batch group
+            current_clusters = self.cluster_ids[buffer_idx].cpu()
+            prev_clusters = self.prev_cluster_ids[layer_idx]
+
+            total_overlap = 0
+            for i in range(self.batch_size * self.kv_head):
+                # Convert to sets and calculate intersection
+                current_set = set(current_clusters[i].tolist())
+                prev_set = set(prev_clusters[i].tolist())
+                overlap = len(current_set & prev_set)
+                total_overlap += overlap
+
+            self.cluster_overlap_stats['total_overlap'][layer_idx] += total_overlap
+            self.cluster_overlap_stats['total_clusters'][layer_idx] += self.batch_size * self.kv_head * self.nprobe
+            self.cluster_overlap_stats['num_samples'][layer_idx] += 1
+
+        # Store current clusters as previous for next iteration of this layer
+        self.prev_cluster_ids[layer_idx].copy_(self.cluster_ids[buffer_idx].cpu())
+        self.prev_cluster_valid[layer_idx] = True
+
+    def get_cache_stats(self, reset=False):
+        """
+        Get cache statistics for all layers
+        Args:
+            reset: if True, reset statistics after retrieval
+        Returns:
+            Dictionary with per-layer statistics including hit rate
+        """
+        stats = {}
+        for ldx in range(self.layer_num):
+            total_accesses = self.cache_stats['total_accesses'][ldx]
+            total_hits = self.cache_stats['total_hits'][ldx]
+            total_misses = self.cache_stats['total_misses'][ldx]
+
+            hit_rate = (total_hits / total_accesses * 100) if total_accesses > 0 else 0.0
+
+            stats[f'layer_{ldx}'] = {
+                'total_hits': total_hits,
+                'total_misses': total_misses,
+                'total_accesses': total_accesses,
+                'hit_rate': hit_rate
+            }
+
+        if reset:
+            self.cache_stats = {
+                'total_hits': [0] * self.layer_num,
+                'total_misses': [0] * self.layer_num,
+                'total_accesses': [0] * self.layer_num
+            }
+
+        return stats
+
+    def get_cluster_overlap_stats(self, reset=False):
+        """
+        Get cluster overlap statistics for all layers
+        Args:
+            reset: if True, reset statistics after retrieval
+        Returns:
+            Dictionary with per-layer cluster overlap statistics
+        """
+        stats = {}
+        for ldx in range(self.layer_num):
+            total_overlap = self.cluster_overlap_stats['total_overlap'][ldx]
+            total_clusters = self.cluster_overlap_stats['total_clusters'][ldx]
+            num_samples = self.cluster_overlap_stats['num_samples'][ldx]
+
+            overlap_rate = (total_overlap / total_clusters * 100) if total_clusters > 0 else 0.0
+            avg_overlap_per_sample = (total_overlap / num_samples) if num_samples > 0 else 0.0
+
+            stats[f'layer_{ldx}'] = {
+                'total_overlap': total_overlap,
+                'total_clusters': total_clusters,
+                'num_samples': num_samples,
+                'overlap_rate': overlap_rate,
+                'avg_overlap_per_sample': avg_overlap_per_sample
+            }
+
+        if reset:
+            self.cluster_overlap_stats = {
+                'total_overlap': [0] * self.layer_num,
+                'total_clusters': [0] * self.layer_num,
+                'num_samples': [0] * self.layer_num
+            }
+
+        return stats
+
+    def print_cache_stats(self, reset=False):
+        """
+        Print cache statistics in a formatted table
+        Args:
+            reset: if True, reset statistics after printing
+        """
+        stats = self.get_cache_stats(reset=False)
+
+        # print("\n" + "="*80)
+        # print("Cache Hit/Miss Statistics")
+        # print("="*80)
+        # print(f"{'Layer':<10} {'Hits':<15} {'Misses':<15} {'Accesses':<15} {'Hit Rate':<15}")
+        # print("-"*80)
+
+        # for ldx in range(self.layer_num):
+        #     layer_stats = stats[f'layer_{ldx}']
+        #     print(f"{ldx:<10} {layer_stats['total_hits']:<15} {layer_stats['total_misses']:<15} "
+        #           f"{layer_stats['total_accesses']:<15} {layer_stats['hit_rate']:<14.2f}%")
+
+        # print("="*80 + "\n")
+        # print average hit rate
+        total_hits = sum(stats[f'layer_{ldx}']['total_hits'] for ldx in range(self.layer_num))
+        total_misses = sum(stats[f'layer_{ldx}']['total_misses'] for ldx in range(self.layer_num))
+        total_accesses = sum(stats[f'layer_{ldx}']['total_accesses'] for ldx in range(self.layer_num))
+        avg_hit_rate = (total_hits / total_accesses * 100) if total_accesses > 0 else 0.0
+        print(f"Average Hit Rate across all layers: {avg_hit_rate:.2f}% ({total_hits} hits, {total_misses} misses, {total_accesses} accesses)") 
+
+        if reset:
+            self.cache_stats = {
+                'total_hits': [0] * self.layer_num,
+                'total_misses': [0] * self.layer_num,
+                'total_accesses': [0] * self.layer_num
+            }
+
+    def get_prev_query_cluster_overlap_stats(self, reset=False):
+        """
+        Get cluster overlap statistics when using previous query
+        Args:
+            reset: if True, reset statistics after retrieval
+        Returns:
+            Dictionary with per-layer cluster overlap statistics
+        """
+        stats = {}
+        for ldx in range(self.layer_num):
+            total_overlap = self.prev_query_cluster_overlap_stats['total_overlap'][ldx]
+            total_clusters = self.prev_query_cluster_overlap_stats['total_clusters'][ldx]
+            num_samples = self.prev_query_cluster_overlap_stats['num_samples'][ldx]
+
+            overlap_rate = (total_overlap / total_clusters * 100) if total_clusters > 0 else 0.0
+            avg_overlap_per_sample = (total_overlap / num_samples) if num_samples > 0 else 0.0
+
+            stats[f'layer_{ldx}'] = {
+                'total_overlap': total_overlap,
+                'total_clusters': total_clusters,
+                'num_samples': num_samples,
+                'overlap_rate': overlap_rate,
+                'avg_overlap_per_sample': avg_overlap_per_sample
+            }
+
+        if reset:
+            self.prev_query_cluster_overlap_stats = {
+                'total_overlap': [0] * self.layer_num,
+                'total_clusters': [0] * self.layer_num,
+                'num_samples': [0] * self.layer_num
+            }
+
+        return stats
+
+    def print_prev_query_cluster_overlap_stats(self, reset=False):
+        """
+        Print cluster overlap statistics when using previous query
+        Args:
+            reset: if True, reset statistics after printing
+        """
+        stats = self.get_prev_query_cluster_overlap_stats(reset=False)
+
+        print("\n" + "="*100)
+        print("Cluster Overlap Statistics (Using Previous Query)")
+        print("="*100)
+        print(f"{'Layer':<10} {'Samples':<12} {'Avg Overlap':<20} {'Overlap Rate':<20} {'nprobe':<10}")
+        print("-"*100)
+
+        for ldx in range(self.layer_num):
+            layer_stats = stats[f'layer_{ldx}']
+            if layer_stats['num_samples'] > 0:
+                print(f"{ldx:<10} {layer_stats['num_samples']:<12} "
+                      f"{layer_stats['avg_overlap_per_sample']:<20.2f} "
+                      f"{layer_stats['overlap_rate']:<19.2f}% "
+                      f"{self.max_compute_cluster_num:<10}")
+
+        print("="*100 + "\n")
+
+        # Calculate average across all layers
+        total_overlap = sum(self.prev_query_cluster_overlap_stats['total_overlap'])
+        total_clusters = sum(self.prev_query_cluster_overlap_stats['total_clusters'])
+        total_samples = sum(self.prev_query_cluster_overlap_stats['num_samples'])
+
+        if total_clusters > 0:
+            avg_overlap_rate = (total_overlap / total_clusters * 100)
+            avg_overlap_per_sample = (total_overlap / total_samples) if total_samples > 0 else 0
+            print(f"Average across all layers:")
+            print(f"  Overlap Rate: {avg_overlap_rate:.2f}%")
+            print(f"  Avg Overlap per Sample: {avg_overlap_per_sample:.2f} / {self.max_compute_cluster_num}\n")
+
+        if reset:
+            self.prev_query_cluster_overlap_stats = {
+                'total_overlap': [0] * self.layer_num,
+                'total_clusters': [0] * self.layer_num,
+                'num_samples': [0] * self.layer_num
+            }
+
+    def print_cluster_overlap_stats(self, reset=False):
+        """
+        Print cluster overlap statistics in a formatted table
+        Args:
+            reset: if True, reset statistics after printing
+        """
+        stats = self.get_cluster_overlap_stats(reset=False)
+
+        print("\n" + "="*90)
+        print("Cluster Overlap Statistics (Consecutive Decoding Steps)")
+        print("="*90)
+        print(f"{'Layer':<10} {'Samples':<12} {'Avg Overlap':<15} {'Overlap Rate':<15} {'nprobe':<10}")
+        print("-"*90)
+
+        for ldx in range(self.layer_num):
+            layer_stats = stats[f'layer_{ldx}']
+            print(f"{ldx:<10} {layer_stats['num_samples']:<12} "
+                  f"{layer_stats['avg_overlap_per_sample']:<15.2f} "
+                  f"{layer_stats['overlap_rate']:<14.2f}% "
+                  f"{self.nprobe:<10}")
+
+        print("="*90 + "\n")
+
+        if reset:
+            self.cluster_overlap_stats = {
+                'total_overlap': [0] * self.layer_num,
+                'total_clusters': [0] * self.layer_num,
+                'num_samples': [0] * self.layer_num
+            }
+
+    def print_all_stats(self, reset=False):
+        """
+        Print all statistics: cache, cluster overlap, and query similarity
+        Args:
+            reset: if True, reset statistics after printing
+        """
+        self.print_cache_stats(reset=False)
+        self.print_cluster_overlap_stats(reset=False)
+        self.print_prev_query_cluster_overlap_stats(reset=False)
+        self.print_query_similarity_stats(reset=reset)
+
+    def get_query_similarity_stats(self, reset=False):
+        """
+        Get query similarity statistics between consecutive decoding steps
+        Args:
+            reset: if True, reset statistics after retrieval
+        Returns:
+            Dictionary with per-layer query similarity statistics
+        """
+        stats = {}
+        for ldx in range(self.layer_num):
+            cosine_sims = self.query_similarity_stats['cosine_similarities'][ldx]
+            l2_dists = self.query_similarity_stats['l2_distances'][ldx]
+
+            if len(cosine_sims) > 0:
+                avg_cosine = np.mean(cosine_sims)
+                std_cosine = np.std(cosine_sims)
+                min_cosine = np.min(cosine_sims)
+                max_cosine = np.max(cosine_sims)
+            else:
+                avg_cosine = std_cosine = min_cosine = max_cosine = 0.0
+
+            if len(l2_dists) > 0:
+                avg_l2 = np.mean(l2_dists)
+                std_l2 = np.std(l2_dists)
+                min_l2 = np.min(l2_dists)
+                max_l2 = np.max(l2_dists)
+            else:
+                avg_l2 = std_l2 = min_l2 = max_l2 = 0.0
+
+            stats[f'layer_{ldx}'] = {
+                'num_steps': len(cosine_sims),
+                'cosine_similarity': {
+                    'mean': avg_cosine,
+                    'std': std_cosine,
+                    'min': min_cosine,
+                    'max': max_cosine,
+                },
+                'l2_distance': {
+                    'mean': avg_l2,
+                    'std': std_l2,
+                    'min': min_l2,
+                    'max': max_l2,
+                }
+            }
+
+        if reset:
+            self.query_similarity_stats = {
+                'cosine_similarities': [[] for _ in range(self.layer_num)],
+                'l2_distances': [[] for _ in range(self.layer_num)]
+            }
+
+        return stats
+
+    def print_query_similarity_stats(self, reset=False):
+        """
+        Print query similarity statistics in a formatted table
+        Args:
+            reset: if True, reset statistics after printing
+        """
+        stats = self.get_query_similarity_stats(reset=False)
+
+        print("\n" + "="*100)
+        print("Query Similarity Statistics (Consecutive Decoding Steps)")
+        print("="*100)
+        print(f"{'Layer':<8} {'Steps':<8} {'Cosine Sim (avg±std)':<25} {'Cosine Range':<20} {'L2 Dist (avg±std)':<25}")
+        print("-"*100)
+
+        for ldx in range(self.layer_num):
+            layer_stats = stats[f'layer_{ldx}']
+            if layer_stats['num_steps'] > 0:
+                cos_stats = layer_stats['cosine_similarity']
+                l2_stats = layer_stats['l2_distance']
+
+                print(f"{ldx:<8} {layer_stats['num_steps']:<8} "
+                      f"{cos_stats['mean']:.4f}±{cos_stats['std']:.4f}        "
+                      f"[{cos_stats['min']:.4f}, {cos_stats['max']:.4f}]      "
+                      f"{l2_stats['mean']:.4f}±{l2_stats['std']:.4f}")
+
+        print("="*100 + "\n")
+
+        # Print average across all layers
+        all_cosine = []
+        all_l2 = []
+        for ldx in range(self.layer_num):
+            all_cosine.extend(self.query_similarity_stats['cosine_similarities'][ldx])
+            all_l2.extend(self.query_similarity_stats['l2_distances'][ldx])
+
+        if len(all_cosine) > 0:
+            print(f"Average across all layers:")
+            print(f"  Cosine Similarity: {np.mean(all_cosine):.4f}±{np.std(all_cosine):.4f}")
+            print(f"  L2 Distance: {np.mean(all_l2):.4f}±{np.std(all_l2):.4f}\n")
+
+        if reset:
+            self.query_similarity_stats = {
+                'cosine_similarities': [[] for _ in range(self.layer_num)],
+                'l2_distances': [[] for _ in range(self.layer_num)]
+            }
+
     def compute(self, queries, layer_idx, queries_next=None):
         """
         queries: query vector, shape: (batch_size, 1, head_num, dim), gpu torch tensor
@@ -554,6 +1287,31 @@ class retroinfer_cache(KV_Cache):
         # assert queries.size(1) == 1
         # assert queries.size(2) == self.kv_head * self.group_size == self.num_heads
         # assert queries.size(3) == self.head_dim
+
+        # Calculate query similarity between consecutive decoding steps
+        # with torch.no_grad():
+        #     # queries shape: [batch_size, 1, num_heads, head_dim]
+        #     # Take first batch, first head (head 0) for similarity calculation
+        #     query_vector = queries[0, 0, 0, :].cpu()  # [head_dim]
+
+        #     # Calculate similarity with previous query if available
+        #     if len(self.decode_queries[layer_idx]) > 0:
+        #         prev_query = torch.from_numpy(self.decode_queries[layer_idx][-1])
+
+        #         # Cosine similarity
+        #         cosine_sim = torch.nn.functional.cosine_similarity(
+        #             query_vector.unsqueeze(0),
+        #             prev_query.unsqueeze(0)
+        #         ).item()
+        #         self.query_similarity_stats['cosine_similarities'][layer_idx].append(cosine_sim)
+
+        #         # L2 distance
+        #         l2_dist = torch.norm(query_vector - prev_query, p=2).item()
+        #         self.query_similarity_stats['l2_distances'][layer_idx].append(l2_dist)
+
+        #     # Store query for visualization if enabled
+        #     if self.enable_prefill_visualization and len(self.decode_queries[layer_idx]) < self.max_decode_steps_to_visualize:
+        #         self.decode_queries[layer_idx].append(query_vector.numpy())
 
         torch.cuda.nvtx.range_push("kv_cache_compute")
         static_len = self.static_pattern_total if layer_idx == self.layer_num - 1 else self.static_pattern_total + 1
@@ -573,10 +1331,20 @@ class retroinfer_cache(KV_Cache):
             dist.masked_fill_(self.centroids_mask[layer_idx], self.DTYPE_MIN)
             self.cI[buffer_idx] = torch.topk(dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True)[1] # [batch_size*group_num, max_consider_cluster]
             self.cluster_ids[buffer_idx].copy_(self.cI[buffer_idx][..., :self.nprobe])
+
+            # Calculate cluster overlap if we had used previous query
+            if self.prev_queries[layer_idx] is not None:
+                self.update_prev_query_cluster_overlap_stats(layer_idx, buffer_idx)
+
+            # Update cluster overlap statistics (consecutive steps)
+            self.update_cluster_overlap_stats(layer_idx)
             # print ("layer ", layer_idx, "selected clusters:", self.cluster_ids[layer_idx])
             # end = time.perf_counter()
             # print (f"layer {layer_idx} select clusters: {(end-start) * 1000:.4f} ms")
             torch.cuda.nvtx.range_pop()
+
+            # Store current query for next step's comparison
+            self.prev_queries[layer_idx] = queries.clone()
 
         # cache access and submit cache update tasks to thread pool
         if layer_idx < 2 or not self.use_cluster_estimation:
@@ -596,6 +1364,8 @@ class retroinfer_cache(KV_Cache):
             dist.masked_fill_(self.centroids_mask[layer_idx + 1], self.DTYPE_MIN)
             self.cI[next_buffer_idx] = torch.topk(dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True)[1] # [batch_size*group_num, max_consider_cluster]
             self.cluster_ids[next_buffer_idx].copy_(self.cI[next_buffer_idx][..., :self.nprobe])
+            # Update cluster overlap statistics for next layer
+            self.update_cluster_overlap_stats(layer_idx + 1)
             # end = time.perf_counter()
             # print (f"layer {layer_idx + 1} estimate clusters: {(end-start) * 1000:.4f} ms")
             torch.cuda.nvtx.range_pop()
@@ -644,10 +1414,14 @@ class retroinfer_cache(KV_Cache):
         if layer_idx < 2 or not self.use_cluster_estimation:
             self.wave_buffer[layer_idx].sync()
             self.wave_buffer[layer_idx].batch_update()
+            # Update statistics after cache access
+            self.update_cache_stats(layer_idx)
         # estimation, next layer access sync
         if self.use_cluster_estimation and layer_idx > 1 and layer_idx < self.layer_num - 1:
             self.wave_buffer[layer_idx + 1].sync()
             self.wave_buffer[layer_idx].batch_update()
+            # Update statistics after cache access
+            self.update_cache_stats(layer_idx)
 
         # assemble the execution buffer
         # start = time.perf_counter()
@@ -656,7 +1430,9 @@ class retroinfer_cache(KV_Cache):
             # print (self.list_keys[layer_idx].device, self.cache_keys[layer_idx].device, self.execution_buffer_keys.device)
             # print ("hit ", torch.sum (self.hit_unit_sizes[layer_idx], dim=1))
             # print ("miss ", torch.sum (self.miss_unit_sizes[layer_idx], dim=1))
+            
             torch.cuda.nvtx.range_push("current_layer_copy")
+            # start = time.perf_counter()
             gather_copy_and_concat(self.steady_zone_keys[layer_idx], self.list_keys[layer_idx], self.cache_keys[layer_idx], self.execution_buffer_keys[buffer_idx],
                                 self.steady_zone_values[layer_idx], self.list_values[layer_idx], self.cache_values[layer_idx], self.execution_buffer_values[buffer_idx],
                                 self.miss_unit_idices[layer_idx], self.miss_unit_sizes[layer_idx], self.miss_unit_sizes_cumsum[layer_idx], self.miss_num_units[layer_idx],
@@ -664,6 +1440,9 @@ class retroinfer_cache(KV_Cache):
                                 self.valid_lengths[buffer_idx], self.batch_groups, 
                                 self.static_stride, self.list_stride, self.cache_stride,
                                 self.execution_stride, self.buffer_size, static_len)
+            # torch.cuda.synchronize()
+            # end = time.perf_counter()
+            # print (f"layer {layer_idx} gather_copy_and_concat time: {(end-start) * 1000:.4f} ms")
             torch.cuda.nvtx.range_pop()
         # next layer copy
         if self.use_cluster_estimation and layer_idx > 1 and layer_idx < self.layer_num - 1 and queries_next is not None:
@@ -723,13 +1502,15 @@ class retroinfer_cache(KV_Cache):
         # layer 1 access and copy
         if self.use_cluster_estimation and layer_idx == 1:
             self.wave_buffer[layer_idx + 1].sync()
+            # Update statistics for layer 2 when using cluster estimation at layer 1
+            self.update_cache_stats(layer_idx + 1)
 
             with torch.cuda.stream(self.copystream):
                 gather_copy_and_concat(self.steady_zone_keys[layer_idx + 1], self.list_keys[layer_idx + 1], self.cache_keys[layer_idx + 1], self.execution_buffer_keys[next_buffer_idx],
                                     self.steady_zone_values[layer_idx + 1], self.list_values[layer_idx + 1], self.cache_values[layer_idx + 1], self.execution_buffer_values[next_buffer_idx],
                                     self.miss_unit_idices[layer_idx + 1], self.miss_unit_sizes[layer_idx + 1], self.miss_unit_sizes_cumsum[layer_idx + 1], self.miss_num_units[layer_idx + 1],
                                     self.hit_unit_idices[layer_idx + 1], self.hit_unit_sizes[layer_idx + 1], self.hit_unit_sizes_cumsum[layer_idx + 1], self.hit_num_units[layer_idx + 1],
-                                    self.valid_lengths[next_buffer_idx], self.batch_groups, 
+                                    self.valid_lengths[next_buffer_idx], self.batch_groups,
                                     self.static_stride, self.list_stride, self.cache_stride,
                                     self.execution_stride, self.buffer_size, static_len)
 

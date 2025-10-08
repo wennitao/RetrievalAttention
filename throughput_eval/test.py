@@ -70,7 +70,7 @@ def generate_config(model_name, context_len, attn_type):
     lower = (n_clusters // (n_segments*32)) * (n_segments*32)
     upper = lower + (n_segments*32)
     n_clusters = lower if abs(n_clusters - lower) <= abs(n_clusters - upper) else upper
-    nprobe = int(n_clusters*0.1)
+    nprobe = int(n_clusters*0.018)
 
     if attn_type == 'RetroInfer':
         original_config[attn_type]['n_centroids'] = n_clusters
@@ -126,7 +126,7 @@ if __name__ == "__main__":
     attention_masks = inputs.attention_mask
 
     input_len = input_ids.shape[1]
-    gen_len = 256
+    gen_len = 16
     max_len = input_len + gen_len
     print(colored(f"Input length: {input_len}", 'yellow'))
 

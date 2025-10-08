@@ -2,7 +2,7 @@
     "RetroInfer": {
         "static_pattern_start": 4,
         "static_pattern_end": 64,
-        "core": 22,
+        "core": 24,
         "n_centroids": 8192,
         "n_segment": 16,
         "nprobe": 150,

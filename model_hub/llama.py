@@ -206,6 +206,7 @@ class LlamaModel(LLM):
                 model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)), 
                 use_cluster_estimation = self.use_cluster_estimation
             )
+            self.kv_cache.enable_visualization()
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
 

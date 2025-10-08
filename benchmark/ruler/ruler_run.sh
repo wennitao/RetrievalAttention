@@ -22,7 +22,7 @@ fi
 # Root Directories
 ROOT_DIR="./ruler_eval_result" # the path that stores generated task samples and model predictions.
 
-NUM_SAMPLES=200
+NUM_SAMPLES=16
 MAX_SEQ_LENGTH=${4}
 ATTN_TYPE=${3}
 DEVICE=auto
