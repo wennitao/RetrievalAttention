@@ -1,2 +1,2 @@
 export LD_LIBRARY_PATH=/mnt/conda/w2ni/miniconda3/envs/retroinfer/lib:$LD_LIBRARY_PATH
-nvcc -o build/balanced_kmeans src/balanced_kmeans.cu -lcuvs -I/mnt/conda/w2ni/miniconda3/envs/retroinfer/include -L/mnt/conda/w2ni/miniconda3/envs/retroinfer/lib -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE --extended-lambda --expt-relaxed-constexpr -lrmm
+nvcc -o build/balanced_kmeans balanced_kmeans/src/balanced_kmeans.cu -lcuvs -I/mnt/conda/w2ni/miniconda3/envs/retroinfer/include -L/mnt/conda/w2ni/miniconda3/envs/retroinfer/lib -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE --extended-lambda --expt-relaxed-constexpr -lrmm

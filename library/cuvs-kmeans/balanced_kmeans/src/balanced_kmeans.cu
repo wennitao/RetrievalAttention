@@ -1,3 +1,6 @@
+#include <pybind11/pybind11.h>
+#include <torch/extension.h>
+
 #include <raft/core/handle.hpp>
 #include <raft/core/operators.hpp>
 #include <raft/random/make_blobs.cuh>
@@ -12,11 +15,49 @@
 
 using namespace cuvs::cluster;
 
-void balanced_kmeans() {
+class BalancedKmeans {
+    public:
+    BalancedKmeans(int64_t n_clusters, int64_t n_iters) 
+        : stream(raft::resource::get_cuda_stream(handle)),
+        n_clusters(n_clusters), n_iters(n_iters) {}
+
+    void fit_predict(
+        torch::Tensor key, // (n_samples, n_features)
+        torch::Tensor value,  
+        torch::Tensor labels, 
+        torch::Tensor centroids, 
+        torch::Tensor cluster_size
+    ) {
+        int64_t n_samples = key.size(0), n_features = key.size(1);
+
+        const float* key_ptr = key.data_ptr<float>();
+        float* centroids_ptr = centroids.data_ptr<float>();
+        uint32_t* labels_ptr = labels.data_ptr<uint32_t>();
+
+        auto X_view = raft::make_device_matrix_view<const float, int64_t>(key_ptr, n_samples, n_features);
+        auto centroids_view = raft::make_device_matrix_view<float, int64_t>(centroids_ptr, n_clusters, n_features);
+        auto labels_view = raft::make_device_vector_view<uint32_t, int64_t>(labels_ptr, n_samples);
+
+        cuvs::cluster::kmeans::balanced_params params;
+        // params.n_clusters = n_clusters;
+        params.n_iters = 20;
+        params.metric = cuvs::distance::DistanceType::InnerProduct;
+
+        cuvs::cluster::kmeans::fit_predict(handle, params, X_view, centroids_view, labels_view);
+        raft::resource::sync_stream(handle, stream);
+    }
+
+    private:
+    raft::resources handle;
+    cudaStream_t stream;
+    int64_t n_clusters, n_iters;
+};
+
+void balanced_kmeans(int64_t seq_len) {
     raft::resources handle;
     cudaStream_t stream = raft::resource::get_cuda_stream(handle);
 
-    int64_t seq_len = 128 * 1000, n_features = 128, n_clusters = 8000;
+    int64_t n_features = 128, n_clusters = seq_len / 16;
     auto X = raft::make_device_matrix<float, int64_t>(handle, seq_len, n_features);
     auto labels = raft::make_device_vector<uint32_t, int64_t>(handle, seq_len);
     auto centroids = raft::make_device_matrix<float, int64_t>(handle, n_clusters, n_features);
@@ -68,7 +109,12 @@ void balanced_kmeans() {
     }
 }
 
-int main() {
-    balanced_kmeans();
-    return 0;
+namespace py = pybind11;
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    py::class_<BalancedKmeans>(m, "BalancedKmeans")
+        .def(py::init<int64_t, int64_t>())
+        .def("fit_predict", &BalancedKmeans::fit_predict);
+
+    m.def("balanced_kmeans", &balanced_kmeans, "balanced_kmeans");
 }
