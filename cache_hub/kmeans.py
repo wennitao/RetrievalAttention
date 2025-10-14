@@ -249,6 +249,8 @@ def segment_k_means(
     centroids = centroids.reshape((-1, num_centroids, head_dim))
     centroids, max_idx, max_cluster_size = _triton_k_means_train(data, centroids, normalize_centroids=False, return_indices=True)
 
+    # print (max_idx.shape)
+    # print (max_idx)
     value_sum = triton_index_add(value.reshape((-1, num_tokens, head_dim)), max_idx, num_centroids)
     clusters, cluster_size = triton_reverse_index(max_idx, num_centroids, max_cluster_size)
 
@@ -257,3 +259,23 @@ def segment_k_means(
     # clusters = clusters.reshape((batch_size*num_groups, num_centroids, max_cluster_size))
     # cluster_size = cluster_size.reshape((batch_size*num_groups, num_centroids))
     return centroids, value_sum, clusters, cluster_size
+
+from balanced_kmeans.BalancedKmeans import BalancedKmeans
+
+def balanced_k_means(
+    key: torch.Tensor,    # [batch_size(=1)*num_heads, num_tokens, head_dim]
+    value: torch.Tensor,  # [batch_size(=1)*num_heads, num_tokens, head_dim]
+    num_centroids: int,
+    num_iters: int = 10,
+):
+    key = key.to(torch.float32)
+    
+    num_groups, num_tokens, head_dim = key.shape
+    balancedkmeans = BalancedKmeans(num_centroids, num_iters)
+    labels = torch.zeros((num_groups, num_tokens), dtype=torch.uint32, device=key.device)
+    centroids = torch.zeros((num_groups, num_centroids, head_dim), dtype=key.dtype, device=key.device)
+
+    for i in range(num_groups):
+        balancedkmeans.fit_predict(key[i], value[i], labels[i], centroids[i])
+    
+    return centroids, labels

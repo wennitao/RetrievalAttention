@@ -25,8 +25,7 @@ class BalancedKmeans {
         torch::Tensor key, // (n_samples, n_features)
         torch::Tensor value,  
         torch::Tensor labels, 
-        torch::Tensor centroids, 
-        torch::Tensor cluster_size
+        torch::Tensor centroids
     ) {
         int64_t n_samples = key.size(0), n_features = key.size(1);
 

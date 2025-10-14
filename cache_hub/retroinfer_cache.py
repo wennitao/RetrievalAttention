@@ -4,7 +4,7 @@ from retroinfer_kernels import ThreadPool, WaveBufferCPU
 from retroinfer_kernels import gather_copy_and_concat, gather_copy_and_scatter, gather_copy_vectors, batch_gemm_softmax
 
 from .cache import KV_Cache
-from .kmeans import segment_k_means
+from .kmeans import segment_k_means, balanced_k_means
 from weighted_flash_decoding import weighted_flash_decoding
 
 import time
@@ -61,7 +61,7 @@ class retroinfer_cache(KV_Cache):
         self.use_cluster_estimation = use_cluster_estimation
 
         self.input_length = self.max_length - max_new_length
-        self.max_new_length = min(max_new_length-1, THRESHOLD_LENGTH)   # already generated one token when prefilling
+        self.max_new_length = max(max_new_length-1, THRESHOLD_LENGTH)   # already generated one token when prefilling
         # used for index update, when exceed THRESHOLD_LENGTH, we need to update the index
         self.input_length_new = ((max_new_length-2) // THRESHOLD_LENGTH) * THRESHOLD_LENGTH
         self.n_centroids_per_update_segment = THRESHOLD_LENGTH // 16    # default avg 16 vectors per cluster
@@ -79,6 +79,7 @@ class retroinfer_cache(KV_Cache):
         self.RSQRT_DIM = 1.0 / math.sqrt(self.head_dim)
         self.DTYPE_MIN = torch.finfo(self.dtype).min
 
+        print (self.static_pattern_total + self.max_new_length)
         # store steady zone
         self.steady_zone_keys = [
             torch.zeros((self.batch_size, self.kv_head, self.static_pattern_total+self.max_new_length, self.head_dim), 
@@ -389,6 +390,11 @@ class retroinfer_cache(KV_Cache):
             self.wave_buffer[layer_idx-1].construction_sync()
         elif batch_idx > 0: # layer_idx == 0
             self.wave_buffer[self.layer_num-1].construction_sync()
+
+        residual_len = valid_length % 16
+        self.static_pattern_end += residual_len
+        self.static_pattern_total += residual_len
+        valid_length -= residual_len
         
         # store in self to avoid deleting when async offload to cpu, shape: (group_num, seq_len, dim)
         self.temp_keys = key_states[0, valid_start+self.static_pattern_start:seq_len-self.static_pattern_end, :, :].transpose(0, 1).contiguous()
@@ -414,6 +420,15 @@ class retroinfer_cache(KV_Cache):
 
         # compute key mean, shape (group_num, 1, head_dim)
         mean_key = torch.mean(self.temp_keys, dim=1, keepdim=True)
+
+        print (self.temp_keys.shape)
+
+        # balanced kmeans
+        _centroids, _labels = balanced_k_means(
+            key=self.temp_keys-mean_key,    # centering to 0
+            value=self.temp_values,
+            num_centroids=valid_length // 16,
+        )
 
         # segmented k-means
         # centroids: (group_num, n_centroids, dim)
