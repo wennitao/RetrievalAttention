@@ -15,9 +15,9 @@
 
 using namespace cuvs::cluster;
 
-class BalancedKmeans {
+class CuvsKmeans {
     public:
-    BalancedKmeans(int64_t n_clusters, int64_t n_iters) 
+    CuvsKmeans(int64_t n_clusters, int64_t n_iters) 
         : stream(raft::resource::get_cuda_stream(handle)),
         n_clusters(n_clusters), n_iters(n_iters) {}
 
@@ -25,9 +25,36 @@ class BalancedKmeans {
         torch::Tensor key, // (n_samples, n_features)
         torch::Tensor value,  
         torch::Tensor labels, 
-        torch::Tensor centroids
+        torch::Tensor centroids 
     ) {
         int64_t n_samples = key.size(0), n_features = key.size(1);
+        float inertia; 
+        int n_iter;
+        
+        const float* key_ptr = key.data_ptr<float>();
+        float* centroids_ptr = centroids.data_ptr<float>();
+        int* labels_ptr = labels.data_ptr<int>();
+
+        auto X_view = raft::make_device_matrix_view<const float, int>(key_ptr, n_samples, n_features);
+        auto centroids_view = raft::make_device_matrix_view<float, int>(centroids_ptr, n_clusters, n_features);
+        auto labels_view = raft::make_device_vector_view<int, int>(labels_ptr, n_samples);
+
+        cuvs::cluster::kmeans::params params;
+        params.n_clusters = n_clusters;
+        params.max_iter = n_iters;
+
+        cuvs::cluster::kmeans::fit_predict(handle, params, X_view, std::nullopt, centroids_view, labels_view, raft::make_host_scalar_view(&inertia), raft::make_host_scalar_view(&n_iter));
+        raft::resource::sync_stream(handle, stream);
+    }
+
+    void balanced_fit_predict(
+        torch::Tensor key, // (n_samples, n_features)
+        torch::Tensor value, 
+        torch::Tensor labels, 
+        torch::Tensor centroids 
+    ) {
+        int64_t n_samples = key.size(0), n_features = key.size(1);
+        int64_t n_clusters = centroids.size(0);
 
         const float* key_ptr = key.data_ptr<float>();
         float* centroids_ptr = centroids.data_ptr<float>();
@@ -111,9 +138,10 @@ void balanced_kmeans(int64_t seq_len) {
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    py::class_<BalancedKmeans>(m, "BalancedKmeans")
+    py::class_<CuvsKmeans>(m, "CuvsKmeans")
         .def(py::init<int64_t, int64_t>())
-        .def("fit_predict", &BalancedKmeans::fit_predict);
+        .def("fit_predict", &CuvsKmeans::fit_predict)
+        .def("balanced_fit_predict", &CuvsKmeans::balanced_fit_predict);
 
     m.def("balanced_kmeans", &balanced_kmeans, "balanced_kmeans");
 }

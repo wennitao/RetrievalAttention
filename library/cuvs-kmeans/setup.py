@@ -8,15 +8,19 @@ ext_modules = [
     CUDAExtension(
         'balanced_kmeans.BalancedKmeans',
         sources=[f'{src_dir}/balanced_kmeans.cu'],
-        include_dirs=['/usr/local/cuda-12.8/include', '/home/nvidia/user/conda/envs/retroinfer/include'],
-        library_dirs=['/usr/local/lib', '/home/nvidia/user/conda/envs/retroinfer/lib'],
-        extra_compile_args={'cxx': ['-O3', '-std=c++17'],
-                          'nvcc': ['-O3', '-std=c++17', '--expt-relaxed-constexpr', '--extended-lambda', '-DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE']},
-        extra_link_args=['-lcuda', '-lcudart', '-lcuvs',
-                        '-Wl,-rpath,/home/nvidia/user/conda/envs/retroinfer/lib',
-                        '-Wl,-rpath,/home/nvidia/user/conda/envs/retroinfer/lib/python3.10/site-packages/torch/lib'],
+        include_dirs=['/usr/local/cuda-12.8/include', '/mnt/conda/w2ni/miniconda3/envs/retroinfer/include'],
+        library_dirs=['/usr/local/lib', '/mnt/conda/w2ni/miniconda3/envs/retroinfer/lib'],
+        extra_compile_args={'cxx': ['-O3', '-std=c++17', '-D_GLIBCXX_USE_CXX11_ABI=1'],
+                          'nvcc': ['-O3', '-std=c++17', '--expt-relaxed-constexpr', '--extended-lambda', '-DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE', '-D_GLIBCXX_USE_CXX11_ABI=1']},
+        extra_link_args=['-lcuda', '-lcudart', '-lcuvs', '-lrmm',
+                        '-Wl,-rpath,/mnt/conda/w2ni/miniconda3/envs/retroinfer/lib',
+                        '-Wl,-rpath,/mnt/conda/w2ni/miniconda3/envs/retroinfer/lib/python3.10/site-packages/torch/lib'],
     ),
 ]
+
+# Force PyTorch to use new C++11 ABI to match RMM
+import torch
+torch._C._GLIBCXX_USE_CXX11_ABI = True
 
 
 setup(

@@ -421,14 +421,16 @@ class retroinfer_cache(KV_Cache):
         # compute key mean, shape (group_num, 1, head_dim)
         mean_key = torch.mean(self.temp_keys, dim=1, keepdim=True)
 
-        print (self.temp_keys.shape)
+        # print (self.temp_keys.shape)
 
         # balanced kmeans
-        _centroids, _labels = balanced_k_means(
-            key=self.temp_keys-mean_key,    # centering to 0
-            value=self.temp_values,
-            num_centroids=valid_length // 16,
-        )
+        # _centroids, _value_sum, _clusters, _cluster_size = balanced_k_means(
+        #     key=self.temp_keys-mean_key,    # centering to 0
+        #     value=self.temp_values,
+        #     num_centroids=valid_length // 16,
+        #     buffer_num_centroids=self.n_centroids,
+        # )
+        # print (_cluster_size)
 
         # segmented k-means
         # centroids: (group_num, n_centroids, dim)
@@ -441,7 +443,7 @@ class retroinfer_cache(KV_Cache):
             num_centroids=self.n_centroids,
             num_segments=self.n_segment,
         )
-        # assert _centroids.shape[-2] == _value_sum.shape[-2] == _cluster_size.shape[-1] == _clusters.shape[-2] == self.n_centroids
+        assert _centroids.shape[-2] == _value_sum.shape[-2] == _cluster_size.shape[-1] == _clusters.shape[-2] == self.n_centroids
         # print (_centroids.shape, _value_sum.shape, _cluster_size.shape, _clusters.shape)
 
         # copy meta index
