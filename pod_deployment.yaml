@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: retroinfer-wentao
+  labels:
+    k8s-app: retroinfer-wentao
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: retroinfer-wentao
+  template:
+    metadata:
+      labels:
+        k8s-app: retroinfer-wentao
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-RTX-A6000
+      containers:
+      - name: mypod
+        image: gitlab-registry.nrp-nautilus.io/stable-ucsd/retroinfer
+        resources:
+           limits:
+             nvidia.com/rtxa6000: 1
+             memory: 64Gi
+             cpu: 4
+           requests:
+             nvidia.com/rtxa6000: 1
+             memory: 64Gi
+             cpu: 4
+        volumeMounts:
+        - mountPath: /mnt/data
+          name: pvc-wentao
+        command: ["sh", "-c", "sleep infinity"]
+      volumes:
+      - name: pvc-wentao
+        persistentVolumeClaim:
+          claimName: pvc-wentao
+      imagePullSecrets:
+      - name: regcred 
