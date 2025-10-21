@@ -1,10 +1,11 @@
 import math
 import torch
+import numpy as np
 from retroinfer_kernels import ThreadPool, WaveBufferCPU
 from retroinfer_kernels import gather_copy_and_concat, gather_copy_and_scatter, gather_copy_vectors, batch_gemm_softmax
 
 from .cache import KV_Cache
-from .kmeans import segment_k_means, balanced_k_means
+from .kmeans import segment_k_means, balanced_k_means, balanced_k_means_v2, sklearn_balanced_k_means, page_partition
 from weighted_flash_decoding import weighted_flash_decoding
 
 import time
@@ -423,7 +424,7 @@ class retroinfer_cache(KV_Cache):
 
         # print (self.temp_keys.shape)
 
-        # balanced kmeans
+        # cuvs balanced kmeans
         # _centroids, _value_sum, _clusters, _cluster_size = balanced_k_means(
         #     key=self.temp_keys-mean_key,    # centering to 0
         #     value=self.temp_values,
@@ -432,19 +433,54 @@ class retroinfer_cache(KV_Cache):
         # )
         # print (_cluster_size)
 
+        # Sinkhorn balanced kmeans
+        # _centroids, _value_sum, _clusters, _cluster_size = balanced_k_means_v2(
+        #     key=self.temp_keys-mean_key,    # centering to 0
+        #     value=self.temp_values,
+        #     num_centroids=valid_length // 16,
+        #     buffer_num_centroids=self.n_centroids,
+        #     num_iters=10,
+        # )
+        # print (_centroids)
+        # print (_cluster_size.shape)
+        # print (_cluster_size)
+
+        # linear sum assignment
+        # _centroids, _value_sum, _clusters, _cluster_size = sklearn_balanced_k_means(
+        #     key=self.temp_keys-mean_key,    # centering to 0
+        #     value=self.temp_values,
+        #     num_centroids=valid_length // 16,
+        #     buffer_num_centroids=self.n_centroids,
+        # )
+
+        # page parition
+        _centroids, _value_sum, _clusters, _cluster_size = page_partition(
+            key=self.temp_keys-mean_key,    # centering to 0
+            value=self.temp_values,
+            page_size=16, 
+            buffer_num_centroids=self.n_centroids,
+        )
+        # print (_centroids.shape, _value_sum.shape, _clusters.shape, _cluster_size.shape)
+        # print (_centroids.dtype, _value_sum.dtype, _clusters.dtype, _cluster_size.dtype)
+
         # segmented k-means
         # centroids: (group_num, n_centroids, dim)
         # value_sum: (group_num, n_centroids, dim)
         # clusters: (group_num, n_centroids, max_cluster_size)
         # cluster_size: (group_num, n_centroids)
-        _centroids, _value_sum, _clusters, _cluster_size = segment_k_means(
-            key=self.temp_keys-mean_key,    # centering to 0
-            value=self.temp_values,
-            num_centroids=self.n_centroids,
-            num_segments=self.n_segment,
-        )
+        # _centroids, _value_sum, _clusters, _cluster_size = segment_k_means(
+        #     key=self.temp_keys-mean_key,    # centering to 0
+        #     value=self.temp_values,
+        #     num_centroids=self.n_centroids,
+        #     num_segments=self.n_segment,
+        # )
         assert _centroids.shape[-2] == _value_sum.shape[-2] == _cluster_size.shape[-1] == _clusters.shape[-2] == self.n_centroids
         # print (_centroids.shape, _value_sum.shape, _cluster_size.shape, _clusters.shape)
+        # print (_cluster_size)
+        # print (_clusters)
+
+        # save cluster assignment
+        # np.savetxt(f"cluster_data/layer{layer_idx}_cluster.txt", _clusters.view(-1, _clusters.shape[-1]).cpu().numpy(), fmt='%d')
 
         # copy meta index
         self.centroids[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :, :].copy_(_centroids + mean_key)         # (group_num, n_centroids, dim)

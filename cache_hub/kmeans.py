@@ -261,7 +261,7 @@ def segment_k_means(
     # cluster_size = cluster_size.reshape((batch_size*num_groups, num_centroids))
     return centroids, value_sum, clusters, cluster_size
 
-from balanced_kmeans.BalancedKmeans import BalancedKmeans
+# from balanced_kmeans.BalancedKmeans import BalancedKmeans
 
 def balanced_k_means(
     key: torch.Tensor,    # [batch_size(=1)*num_heads, num_tokens, head_dim]
@@ -283,5 +283,169 @@ def balanced_k_means(
 
     value_sum = triton_index_add(value.reshape((-1, num_tokens, head_dim)), labels, buffer_num_centroids)
     clusters, cluster_size = triton_reverse_index(labels, buffer_num_centroids, max_cluster_size)
+
+    return centroids, value_sum, clusters, cluster_size
+
+def l2norm(x, eps=1e-12):
+    return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+def sinkhorn_balanced(logits, col_sum, iters=50, eps=1e-9):
+    # logits: [n, k] (higher is better). We want row sums=1, col sums=col_sum
+    # Compute exp with temperature baked into logits by caller.
+    P = torch.exp(logits)        # [n,k]
+    r = torch.ones(P.size(0), device=P.device)      # target row sum = 1
+    c = col_sum * torch.ones(P.size(1), device=P.device)  # target col sum = n/k
+    for _ in range(iters):
+        # scale rows to 1
+        row_sum = P.sum(dim=1) + eps
+        P = P / row_sum[:, None]
+        # scale cols to c
+        col_sum_now = P.sum(dim=0) + eps
+        P = P / (col_sum_now[None, :] / c[None, :])
+    return P
+
+def balanced_spherical_kmeans(
+    X: torch.Tensor, 
+    k: int, 
+    iters=20, 
+    sinkhorn_iters=60, 
+    tau=0.05
+):
+    # X: [n,d], float32/16 on GPU
+    X = l2norm(X)
+    n, d = X.shape
+    t = n // k  # assumes divisible; otherwise mix floor/ceil in col_sum
+    # init: k random unit rows
+    idx = torch.randperm(n, device=X.device)[:k]
+    C = l2norm(X[idx].clone())
+    for _ in range(iters):
+        # scores and OT
+        S = X @ C.t()                    # [n,k] GEMM
+        logits = S / tau
+        P = sinkhorn_balanced(logits, col_sum=float(t), iters=sinkhorn_iters)
+        # update centroids
+        C = l2norm(P.to(X.dtype).t() @ X)            # [k,d] GEMM + norm
+        # (optional) decrease tau for crisper assignments
+        tau = max(tau * 0.9, 0.01)
+    # Hard assignment with exact sizes (greedy)
+    # Pick top-t per cluster, resolve conflicts by smallest delta-loss moves
+    labels = torch.full((n,), -1, device=X.device, dtype=torch.long)
+    scores = S.detach()
+    taken = torch.zeros(n, dtype=torch.bool, device=X.device)
+    for j in range(k):
+        # choose t highest scores for cluster j among untaken
+        sc = scores[:, j].clone()
+        sc[taken] = -1e9
+        pick = torch.topk(sc, t, sorted=False).indices
+        labels[pick] = j
+        taken[pick] = True
+    # (Optional) if any -1 remain due to indivisible n, fill by best score
+    if (labels == -1).any():
+        rem = torch.where(labels == -1)[0]
+        best = scores[rem].argmax(dim=1)
+        labels[rem] = best
+    
+    return labels, C
+    
+def balanced_k_means_v2(
+    key: torch.Tensor,    # [batch_size(=1)*num_heads, num_tokens, head_dim]
+    value: torch.Tensor,  # [batch_size(=1)*num_heads, num_tokens, head_dim]
+    num_centroids: int,
+    buffer_num_centroids: int,
+    num_iters: int = 10,
+):    
+    key = key.to(torch.float32)
+
+    num_groups, num_tokens, head_dim = key.shape
+    labels = torch.zeros((num_groups, num_tokens), dtype=torch.long, device=key.device)
+    centroids = torch.zeros((num_groups, buffer_num_centroids, head_dim), dtype=torch.bfloat16, device=key.device)
+    max_cluster_size = 16
+
+    for i in range(num_groups):
+        lbls, ctrs = balanced_spherical_kmeans(key[i], num_centroids, iters=num_iters)
+        labels[i] = lbls
+        centroids[i][:num_centroids] = ctrs.to(torch.bfloat16)
+
+    value_sum = triton_index_add(value.reshape((-1, num_tokens, head_dim)), labels, buffer_num_centroids)
+    clusters, cluster_size = triton_reverse_index(labels, buffer_num_centroids, max_cluster_size)
+
+    return centroids, value_sum, clusters, cluster_size
+
+from sklearn.cluster import KMeans
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
+import numpy as np
+
+def get_even_clusters(X, n_clusters, cluster_size):
+    kmeans = KMeans(n_clusters, max_iter=10)
+    kmeans.fit(X)
+    centers = kmeans.cluster_centers_
+    centers = centers.reshape(-1, 1, X.shape[-1]).repeat(cluster_size, 1).reshape(-1, X.shape[-1])
+    distance_matrix = cdist(X, centers)
+    clusters = linear_sum_assignment(distance_matrix)[1]//cluster_size
+    return clusters
+
+def sklearn_balanced_k_means(
+    key: torch.Tensor,    # [batch_size(=1)*num_heads, num_tokens, head_dim]
+    value: torch.Tensor,  # [batch_size(=1)*num_heads, num_tokens, head_dim]
+    num_centroids: int,
+    buffer_num_centroids: int,
+    cluster_size: int = 16,
+):
+    key = key.to(torch.float32).cpu().numpy()
+
+    num_groups, num_tokens, head_dim = key.shape
+    labels = np.zeros((num_groups, num_tokens), dtype=np.int32)
+    centroids = np.zeros((num_groups, buffer_num_centroids, head_dim), dtype=np.float32)
+    max_cluster_size = cluster_size
+
+    for i in range(num_groups):
+        lbls = get_even_clusters(key[i], num_centroids, cluster_size)
+        labels[i] = lbls
+        for j in range(num_centroids):
+            centroids[i][j] = key[i][labels[i]==j].mean(axis=0)
+
+    labels_tensor = torch.from_numpy(labels).to(torch.int32).to(key.device)
+    centroids_tensor = torch.from_numpy(centroids).to(key.device).to(torch.bfloat16)
+    value_tensor = torch.from_numpy(value).to(key.device)
+
+    value_sum = triton_index_add(value_tensor.reshape((-1, num_tokens, head_dim)), labels_tensor, buffer_num_centroids)
+    clusters, cluster_size = triton_reverse_index(labels_tensor, buffer_num_centroids, max_cluster_size)
+
+    return centroids_tensor, value_sum, clusters, cluster_size
+
+def page_partition(
+    key: torch.Tensor,    # [batch_size(=1)*num_heads, num_tokens, head_dim]
+    value: torch.Tensor,  # [batch_size(=1)*num_heads, num_tokens, head_dim]
+    page_size: int = 16,
+    buffer_num_centroids: int = 1024,
+):
+    num_groups, num_tokens, head_dim = key.shape
+    num_pages = num_tokens // page_size  # assumes num_tokens divisible by page_size
+
+    # Reshape to [num_groups, num_pages, page_size, head_dim]
+    key_pages = key.reshape(num_groups, num_pages, page_size, head_dim)
+    value_pages = value.reshape(num_groups, num_pages, page_size, head_dim)
+
+    # Calculate centroids as mean of each page
+    centroids = key_pages.mean(dim=2)  # [num_groups, num_pages, head_dim]
+
+    # Calculate value sum for each page
+    value_sum = value_pages.sum(dim=2)  # [num_groups, num_pages, head_dim]
+
+    # Create clusters: each page contains sequential token indices
+    clusters = torch.arange(num_tokens, device=key.device, dtype=torch.int32).reshape(num_pages, page_size)
+    clusters = clusters.unsqueeze(0).expand(num_groups, -1, -1).contiguous()  # [num_groups, num_pages, page_size]
+
+    # Cluster size is page_size for all pages
+    cluster_size = torch.full((num_groups, num_pages), page_size, dtype=torch.int32, device=key.device)
+
+    # Pad to buffer_num_centroids
+    if num_pages < buffer_num_centroids:
+        pad_pages = buffer_num_centroids - num_pages
+        centroids = torch.nn.functional.pad(centroids, (0, 0, 0, pad_pages))  # [num_groups, buffer_num_centroids, head_dim]
+        value_sum = torch.nn.functional.pad(value_sum, (0, 0, 0, pad_pages))  # [num_groups, buffer_num_centroids, head_dim]
+        clusters = torch.nn.functional.pad(clusters, (0, 0, 0, pad_pages))    # [num_groups, buffer_num_centroids, page_size]
+        cluster_size = torch.nn.functional.pad(cluster_size, (0, pad_pages))  # [num_groups, buffer_num_centroids]
 
     return centroids, value_sum, clusters, cluster_size
