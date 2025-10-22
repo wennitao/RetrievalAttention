@@ -407,5 +407,6 @@ benchmark/ruler/data/synthetic/json/*.json
 benchmark/ruler/ruler_eval_result/
 throughput_eval/plots/
 throughput_eval/cluster_data
+throughput_eval/cluster_plots
 *.nsys-rep
 *.ncu-rep

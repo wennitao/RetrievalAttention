@@ -9,6 +9,9 @@ from .kmeans import segment_k_means, balanced_k_means, balanced_k_means_v2, skle
 from weighted_flash_decoding import weighted_flash_decoding
 
 import time
+import matplotlib.pyplot as plt
+
+from .profiling import *
 
 # update segment size
 THRESHOLD_LENGTH = 1024
@@ -365,7 +368,133 @@ class retroinfer_cache(KV_Cache):
                 self.cluster_size[ldx] = self.cluster_size[ldx].to(self.layer_mapping[str(ldx)]).contiguous()
             self.cache_stride = self.cache_size
             self.allocate_computation_buffer()
-    
+
+    def plot_cluster_contiguity(self, clusters, layer_idx, save_dir="cluster_plots"):
+        """
+        Plot cluster assignments for all heads:
+        1. Transition heatmap (green=contiguous, red=transition)
+        2. Cluster span histogram (max_index - min_index per cluster)
+
+        Args:
+            clusters: cluster assignment tensor, shape (group_num, n_centroids, max_cluster_size)
+            layer_idx: layer index for labeling
+            save_dir: directory to save plots
+        """
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+
+        num_heads = clusters.shape[0]
+        n_centroids, max_cluster_size = clusters.shape[1], clusters.shape[2]
+
+        # Create two figures
+        n_cols = min(4, num_heads)
+        n_rows = (num_heads + n_cols - 1) // n_cols
+
+        # Figure 1: Transition heatmaps
+        fig1, axes1 = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 4*n_rows))
+        if num_heads == 1:
+            axes1 = np.array([axes1])
+        axes1 = axes1.flatten()
+
+        # Figure 2: Span histograms
+        fig2, axes2 = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 4*n_rows))
+        if num_heads == 1:
+            axes2 = np.array([axes2])
+        axes2 = axes2.flatten()
+
+        for head_idx in range(num_heads):
+            # Get assignments for this head: (n_centroids, max_cluster_size)
+            head_clusters = clusters[head_idx].cpu().numpy()
+
+            # Calculate cluster spans (max_idx - min_idx for each cluster)
+            cluster_spans = []
+            for cluster_id in range(n_centroids):
+                valid_indices = head_clusters[cluster_id][head_clusters[cluster_id] > 0]
+                if len(valid_indices) > 0:
+                    span = int(valid_indices.max()) - int(valid_indices.min())
+                    cluster_spans.append(span)
+
+            # Plot span histogram
+            if len(cluster_spans) > 0:
+                axes2[head_idx].hist(cluster_spans, bins=50, edgecolor='black', alpha=0.7)
+                axes2[head_idx].set_xlabel('Cluster Span (max_idx - min_idx)', fontsize=9)
+                axes2[head_idx].set_ylabel('Count', fontsize=9)
+                axes2[head_idx].set_title(f'Head {head_idx}\nMean: {np.mean(cluster_spans):.1f}, Median: {np.median(cluster_spans):.1f}', fontsize=10)
+                axes2[head_idx].grid(True, alpha=0.3)
+            else:
+                axes2[head_idx].text(0.5, 0.5, 'No valid data', ha='center', va='center',
+                                    transform=axes2[head_idx].transAxes)
+                axes2[head_idx].set_title(f'Head {head_idx}', fontsize=11)
+
+            # Create inverse mapping: index -> cluster_id
+            max_idx = -1
+            for cluster_id in range(n_centroids):
+                for idx in head_clusters[cluster_id]:
+                    if idx >= 0:
+                        max_idx = max(max_idx, int(idx))
+
+            if max_idx < 0:
+                axes1[head_idx].text(0.5, 0.5, 'No valid data', ha='center', va='center',
+                                   transform=axes1[head_idx].transAxes)
+                axes1[head_idx].set_title(f'Head {head_idx}', fontsize=11)
+                continue
+
+            # Create index->cluster mapping
+            index_to_cluster = np.full(max_idx + 1, -1, dtype=np.int32)
+            for cluster_id in range(n_centroids):
+                for idx in head_clusters[cluster_id]:
+                    if idx >= 0:
+                        index_to_cluster[int(idx)] = cluster_id
+
+            # Calculate cluster changes
+            cluster_change = np.zeros_like(index_to_cluster, dtype=np.float32)
+            for i in range(1, len(index_to_cluster)):
+                if index_to_cluster[i] >= 0 and index_to_cluster[i-1] >= 0:
+                    cluster_change[i] = 1.0 if index_to_cluster[i] != index_to_cluster[i-1] else 0.0
+                else:
+                    cluster_change[i] = -1  # invalid/padding
+
+            # Reshape into 2D for heatmap
+            chunk_size = 100
+            n_chunks = (len(cluster_change) + chunk_size - 1) // chunk_size
+            padded_size = n_chunks * chunk_size
+            padded = np.pad(cluster_change, (0, padded_size - len(cluster_change)),
+                           constant_values=-1)
+            reshaped = padded.reshape(n_chunks, chunk_size)
+            masked_data = np.ma.masked_where(reshaped == -1, reshaped)
+
+            # Plot transition heatmap
+            im = axes1[head_idx].imshow(masked_data, aspect='auto', cmap='RdYlGn_r',
+                                       interpolation='nearest', vmin=0, vmax=1)
+            axes1[head_idx].set_xlabel('Index within chunk', fontsize=9)
+            axes1[head_idx].set_ylabel('Chunk ID', fontsize=9)
+            axes1[head_idx].set_title(f'Head {head_idx}', fontsize=11)
+
+        # Hide unused subplots
+        for idx in range(num_heads, len(axes1)):
+            axes1[idx].axis('off')
+        for idx in range(num_heads, len(axes2)):
+            axes2[idx].axis('off')
+
+        # Finalize and save figures
+        plt.figure(fig1.number)
+        plt.suptitle(f'Layer {layer_idx} - Cluster Transition Map (All Heads)\nGreen = contiguous, Red = transition',
+                     fontsize=14, y=0.995)
+        plt.tight_layout()
+        save_path1 = os.path.join(save_dir, f"cluster_transitions_layer{layer_idx}.png")
+        plt.savefig(save_path1, dpi=150, bbox_inches='tight')
+        print(f"Cluster transition map saved to {save_path1}")
+        plt.close(fig1)
+
+        plt.figure(fig2.number)
+        plt.suptitle(f'Layer {layer_idx} - Cluster Span Distribution (All Heads)\nLower span = more contiguous',
+                     fontsize=14, y=0.995)
+        plt.tight_layout()
+        save_path2 = os.path.join(save_dir, f"cluster_spans_layer{layer_idx}.png")
+        plt.savefig(save_path2, dpi=150, bbox_inches='tight')
+        print(f"Cluster span histogram saved to {save_path2}")
+        plt.close(fig2)
+
 
     def prefill_update_kv_cache(self, query_states, key_states, value_states, layer_idx, batch_idx): 
         """
@@ -392,10 +521,10 @@ class retroinfer_cache(KV_Cache):
         elif batch_idx > 0: # layer_idx == 0
             self.wave_buffer[self.layer_num-1].construction_sync()
 
-        residual_len = valid_length % 16
-        self.static_pattern_end += residual_len
-        self.static_pattern_total += residual_len
-        valid_length -= residual_len
+        # residual_len = valid_length % 16
+        # self.static_pattern_end += residual_len
+        # self.static_pattern_total += residual_len
+        # valid_length -= residual_len
         
         # store in self to avoid deleting when async offload to cpu, shape: (group_num, seq_len, dim)
         self.temp_keys = key_states[0, valid_start+self.static_pattern_start:seq_len-self.static_pattern_end, :, :].transpose(0, 1).contiguous()
@@ -454,12 +583,12 @@ class retroinfer_cache(KV_Cache):
         # )
 
         # page parition
-        _centroids, _value_sum, _clusters, _cluster_size = page_partition(
-            key=self.temp_keys-mean_key,    # centering to 0
-            value=self.temp_values,
-            page_size=16, 
-            buffer_num_centroids=self.n_centroids,
-        )
+        # _centroids, _value_sum, _clusters, _cluster_size = page_partition(
+        #     key=self.temp_keys-mean_key,    # centering to 0
+        #     value=self.temp_values,
+        #     page_size=16, 
+        #     buffer_num_centroids=self.n_centroids,
+        # )
         # print (_centroids.shape, _value_sum.shape, _clusters.shape, _cluster_size.shape)
         # print (_centroids.dtype, _value_sum.dtype, _clusters.dtype, _cluster_size.dtype)
 
@@ -468,19 +597,22 @@ class retroinfer_cache(KV_Cache):
         # value_sum: (group_num, n_centroids, dim)
         # clusters: (group_num, n_centroids, max_cluster_size)
         # cluster_size: (group_num, n_centroids)
-        # _centroids, _value_sum, _clusters, _cluster_size = segment_k_means(
-        #     key=self.temp_keys-mean_key,    # centering to 0
-        #     value=self.temp_values,
-        #     num_centroids=self.n_centroids,
-        #     num_segments=self.n_segment,
-        # )
+        _centroids, _value_sum, _clusters, _cluster_size = segment_k_means(
+            key=self.temp_keys-mean_key,    # centering to 0
+            value=self.temp_values,
+            num_centroids=self.n_centroids,
+            num_segments=self.n_segment,
+        )
         assert _centroids.shape[-2] == _value_sum.shape[-2] == _cluster_size.shape[-1] == _clusters.shape[-2] == self.n_centroids
         # print (_centroids.shape, _value_sum.shape, _cluster_size.shape, _clusters.shape)
         # print (_cluster_size)
         # print (_clusters)
 
         # save cluster assignment
-        # np.savetxt(f"cluster_data/layer{layer_idx}_cluster.txt", _clusters.view(-1, _clusters.shape[-1]).cpu().numpy(), fmt='%d')
+        # np.savetxt(f"cluster_data/qa/layer{layer_idx}_cluster.txt", _clusters.view(-1, _clusters.shape[-1]).cpu().numpy(), fmt='%d')
+
+        # plot cluster contiguity for all heads
+        # self.plot_cluster_contiguity(_clusters, layer_idx, save_dir="cluster_plots/qa")
 
         # copy meta index
         self.centroids[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :, :].copy_(_centroids + mean_key)         # (group_num, n_centroids, dim)
@@ -622,7 +754,7 @@ class retroinfer_cache(KV_Cache):
         if layer_idx < 2 or not self.use_cluster_estimation:
             torch.cuda.nvtx.range_push("search_topk_clusters")
             # search for TopK centroids
-            # start = time.perf_counter()
+            start = time.perf_counter()
             batch_gemm_softmax(queries, self.centroids[layer_idx], self.gemm_o, self.norm, self.sum, self.softmax_o,
                             self.batch_groups, self.group_size, self.n_centroids, self.head_dim,
                             self.RSQRT_DIM, 0)       # [batch_size*group_num, group_size, n_centroids]
@@ -631,8 +763,9 @@ class retroinfer_cache(KV_Cache):
             self.cI[buffer_idx] = torch.topk(dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True)[1] # [batch_size*group_num, max_consider_cluster]
             self.cluster_ids[buffer_idx].copy_(self.cI[buffer_idx][..., :self.nprobe])
             # print ("layer ", layer_idx, "selected clusters:", self.cluster_ids[layer_idx])
-            # end = time.perf_counter()
+            end = time.perf_counter()
             # print (f"layer {layer_idx} select clusters: {(end-start) * 1000:.4f} ms")
+            select_clusters_time.append((end-start) * 1000)
             torch.cuda.nvtx.range_pop()
 
         # cache access and submit cache update tasks to thread pool
@@ -671,7 +804,7 @@ class retroinfer_cache(KV_Cache):
         # estimation zone computation
         if self.es_cluster_num > 0:
             torch.cuda.nvtx.range_push("estimation_zone")
-            # start = time.perf_counter()
+            start = time.perf_counter()
             gather_copy_vectors(self.centroids[layer_idx], self.es_centroids, 
                                 self.value_sum[layer_idx], self.es_value_sum, 
                                 self.cluster_size[layer_idx], self.es_cluster_size,
@@ -690,16 +823,19 @@ class retroinfer_cache(KV_Cache):
                 previous_out=None, previous_lse=None,
                 return_softmax_lse=True)
             # torch.cuda.synchronize()
-            # end = time.perf_counter()
+            end = time.perf_counter()
             # print (f"layer {layer_idx} estimation zone flash attention: {(end-start) * 1000:.4f} ms")
-
+            estimation_time.append((end-start) * 1000)
             torch.cuda.nvtx.range_pop()
         else:
             es_out, es_lse = None, None
 
         # no estimation, current layer access sync
         if layer_idx < 2 or not self.use_cluster_estimation:
+            start = time.perf_counter()
             self.wave_buffer[layer_idx].sync()
+            end = time.perf_counter()
+            buffer_access_time.append((end-start) * 1000)
             self.wave_buffer[layer_idx].batch_update()
         # estimation, next layer access sync
         if self.use_cluster_estimation and layer_idx > 1 and layer_idx < self.layer_num - 1:
@@ -707,7 +843,7 @@ class retroinfer_cache(KV_Cache):
             self.wave_buffer[layer_idx].batch_update()
 
         # assemble the execution buffer
-        # start = time.perf_counter()
+        start = time.perf_counter()
         # current layer copy
         if layer_idx < 2 or not self.use_cluster_estimation:
             # print (self.list_keys[layer_idx].device, self.cache_keys[layer_idx].device, self.execution_buffer_keys.device)
@@ -734,9 +870,10 @@ class retroinfer_cache(KV_Cache):
                                     self.static_stride, self.list_stride, self.cache_stride,
                                     self.execution_stride, self.buffer_size, static_len)
             torch.cuda.nvtx.range_pop()
-        # torch.cuda.synchronize()
-        # end = time.perf_counter()
-        # print (f"gather_copy_and_concat time: {(end-start) * 1000:.4f} ms")
+        torch.cuda.synchronize()
+        end = time.perf_counter()
+        # print (f"layer {layer_idx} gather_copy_and_concat time: {(end-start) * 1000:.4f} ms")
+        gather_time.append((end-start) * 1000)
 
         if self.use_cluster_estimation and layer_idx == 1:
             torch.cuda.nvtx.range_push("next_layer_access")
@@ -745,7 +882,7 @@ class retroinfer_cache(KV_Cache):
 
         # flash attention for retrieve zone and steady zone, merge the estimation zone results at the same time
         torch.cuda.nvtx.range_push("flash_attention")
-        # start = time.perf_counter()
+        start = time.perf_counter()
         attn_out = weighted_flash_decoding(
             queries.view(self.batch_groups, 1, self.group_size, self.head_dim), 
             self.execution_buffer_keys[buffer_idx],    # (batch_size*group_num, execution_stride, 1, dim)
@@ -755,27 +892,30 @@ class retroinfer_cache(KV_Cache):
             cache_seqlens=self.valid_lengths[buffer_idx],
             return_softmax_lse=False
         )
-        # torch.cuda.synchronize()
-        # end = time.perf_counter()
+        torch.cuda.synchronize()
+        end = time.perf_counter()
         # print (f"layer {layer_idx} flash attention time: {(end-start) * 1000:.4f} ms")
+        flash_attn_time.append((end-start) * 1000)
         torch.cuda.nvtx.range_pop()
 
         # admiss pages from execution buffer to GPU cache
-        # start = time.perf_counter()
+        start = time.perf_counter()
         # update sync
         self.wave_buffer[layer_idx].sync()  # wait for update LRU finish
-        # end = time.perf_counter()
+        end = time.perf_counter()
         # print (f"layer {layer_idx} wave_buffer sync time: {(end-start) * 1000:.4f} ms")
+        buffer_update_time.append((end-start) * 1000)
 
-        # start = time.perf_counter()
+        start = time.perf_counter()
         with torch.cuda.stream(self.copystream):
             gather_copy_and_scatter(self.execution_buffer_keys[buffer_idx], self.cache_keys[layer_idx], self.execution_buffer_values[buffer_idx], self.cache_values[layer_idx],
                                     self.update_buffer_indices[layer_idx], self.update_unit_sizes[layer_idx], self.update_cache_indices[layer_idx], 
                                     self.update_num_units[layer_idx], self.batch_groups, self.execution_stride, self.cache_stride,
                                     self.buffer_size, static_len)
-        # torch.cuda.synchronize()
-        # end = time.perf_counter()
+        torch.cuda.synchronize()
+        end = time.perf_counter()
         # print (f"gather copy and scatter {(end-start) * 1000:.4f} ms")
+        cache_update_time.append((end-start) * 1000)
 
         # layer 1 access and copy
         if self.use_cluster_estimation and layer_idx == 1:
@@ -793,3 +933,5 @@ class retroinfer_cache(KV_Cache):
         torch.cuda.nvtx.range_pop()
 
         return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
+
+    

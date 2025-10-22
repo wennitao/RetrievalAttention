@@ -1,7 +1,9 @@
 import time
+import numpy as np
 import torch
 from termcolor import colored
 
+from cache_hub.profiling import *
 
 class LLM:
     """
@@ -90,6 +92,7 @@ class LLM:
     def layer_decode(self, layer_idx, hidden_states):
         # print(f'Layer = {layer_idx}')
 
+        start = time.perf_counter()
         residual = hidden_states
         bsz, seq_len, dim = hidden_states.shape
         layer = self.layers[layer_idx]
@@ -112,17 +115,27 @@ class LLM:
 
         if estimate_next_query:
             query_states_next = query_states_next.view(bsz, -1, self.num_heads, self.head_dim)
+        end = time.perf_counter()
+        qkv_time.append((end-start) * 1000)
 
         key_states, value_states = self.kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
+        
+        start = time.perf_counter()
         attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx, query_states_next)
+        end = time.perf_counter()
+        attention_time.append((end-start) * 1000)
+        
         hidden_states = self.wo(attn_out, layer, bsz, seq_len, dim)
         hidden_states = residual + hidden_states
 
         torch.cuda.nvtx.range_push("mlp")
+        start = time.perf_counter()
         residual = hidden_states
         hidden_states = self.layernorm(hidden_states, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
         hidden_states = self.mlp(hidden_states, layer)
         hidden_states = residual + hidden_states
+        end = time.perf_counter()
+        mlp_time.append((end-start) * 1000)
         torch.cuda.nvtx.range_pop()
 
         return hidden_states
@@ -204,7 +217,38 @@ class LLM:
             f"Throughput: {round(self.batch_size * (self.max_new_length - 1) / (decode_end - decode_start), 2)} tokens/s\n",
             'green'
         ))
-        
+
+        layer_latency = (decode_end - decode_start) * 1000 / ((self.max_new_length - 1) * self.num_layers)
+        attention_latency = np.mean(attention_time)
+
+        print("Total profiling time statistics (ms):")
+        print(f"qkv computation time: {np.mean(qkv_time):.2f}%")
+        print(f"Attention time: {np.mean(attention_time):.2f}%")
+        print(f"MLP time: {np.mean(mlp_time):.2f}%")
+        print()
+
+        print(f"Select clusters time: {np.mean(select_clusters_time):.2f}%")
+        print(f"Estimation zone flash attention time: {np.mean(estimation_time):.2f}%")
+        print(f"Buffer access sync time: {np.mean(buffer_access_time):.2f}%")
+        print(f"Gather copy and concat time: {np.mean(gather_time):.2f}%")
+        print(f"Buffer update sync time: {np.mean(buffer_update_time):.2f}%")
+        print(f"Flash attention time: {np.mean(flash_attn_time):.2f}%")
+        print(f"Cache update time: {np.mean(cache_update_time):.2f}%")
+        print()
+
+        print(f"qkv computation time percentage: {np.mean(qkv_time) / layer_latency:.2f}%")
+        print(f"Attention time percentage: {np.mean(attention_time) / layer_latency:.2f}%")
+        print(f"MLP time percentage: {np.mean(mlp_time) / layer_latency:.2f}%")
+        print()
+
+        print(f"Select clusters time percentage: {np.mean(select_clusters_time) / attention_latency:.2f}%")
+        print(f"Estimation zone flash attention time percentage: {np.mean(estimation_time) / attention_latency:.2f}%")
+        print(f"Buffer access sync time percentage: {np.mean(buffer_access_time) / attention_latency:.2f}%")
+        print(f"Gather copy and concat time percentage: {np.mean(gather_time) / attention_latency:.2f}%")
+        print(f"Buffer update sync time percentage: {np.mean(buffer_update_time) / attention_latency:.2f}%")
+        print(f"Flash attention time percentage: {np.mean(flash_attn_time) / attention_latency:.2f}%")
+        print(f"Cache update time percentage: {np.mean(cache_update_time) / attention_latency:.2f}%")
+
         outputs_ids = torch.cat(outputs_ids, dim=-1).tolist()
         
         return outputs_ids
