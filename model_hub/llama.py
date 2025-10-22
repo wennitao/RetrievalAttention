@@ -8,7 +8,7 @@ import flashinfer
 from transformers import AutoTokenizer, LlamaForCausalLM, LlamaConfig
 from .LLM import LLM
 from cache_hub import flash_attn_cache, retroinfer_cache
-from attn_hub import prefill_full_flash_attn, decode_full_flash_attn, retroinfer_prefill_attn, retroinfer_decode_attn
+from attn_hub import prefill_full_flash_attn, decode_full_flash_attn, retroinfer_prefill_attn, retroinfer_decode_attn, flashinfer_decode_attn
 
 
 
@@ -179,7 +179,7 @@ class LlamaModel(LLM):
                 num_gpus = self.num_gpus,
                 model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1))
             )
-        elif self.attention_type == 'RetroInfer':
+        elif self.attention_type == 'RetroInfer' or self.attention_type == "FlashInfer":
             retroinfer_config = llama_config.get(self.attention_type)
 
             self.kv_cache = retroinfer_cache(
@@ -206,6 +206,9 @@ class LlamaModel(LLM):
                 model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)), 
                 use_cluster_estimation = self.use_cluster_estimation
             )
+
+            if self.attention_type == 'FlashInfer':
+                self.kv_cache.init_flashinfer()
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
 
@@ -247,7 +250,7 @@ class LlamaModel(LLM):
     def prefill_attention(self, query_states, key_states, value_states):
         if self.attention_type == 'Full_Flash_Attn':
             attn_out = prefill_full_flash_attn(query_states, key_states, value_states, causal=True)
-        elif self.attention_type == 'RetroInfer':
+        elif self.attention_type == 'RetroInfer' or self.attention_type == "FlashInfer":
             attn_out = retroinfer_prefill_attn(query_states, key_states, value_states, causal=True)
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
@@ -259,6 +262,8 @@ class LlamaModel(LLM):
             attn_out = decode_full_flash_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'RetroInfer':
             attn_out = retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache, query_states_next)
+        elif self.attention_type == "FlashInfer":
+            attn_out = flashinfer_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
         return attn_out

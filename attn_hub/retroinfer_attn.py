@@ -22,3 +22,11 @@ def retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, re
     )
     
     return attn_out
+
+def flashinfer_decode_attn(query_states, key_states, value_states, layer_idx, retroinfer_cache):
+    
+    attn_out = retroinfer_cache.compute_flashinfer(
+        query_states.contiguous(), layer_idx, 
+    )
+    
+    return attn_out

@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda:0", help="Device")
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"], help="Dtype")
     parser.add_argument("--attn_type", type=str, default="Full_Flash_Attn",                                                 \
-                        choices=["Full_Flash_Attn", "RetroInfer"], help="Attention method")
+                        choices=["Full_Flash_Attn", "RetroInfer", "FlashInfer"], help="Attention method")
     parser.add_argument("--model_name", type=str, default="gradientai/Llama-3-8B-Instruct-Gradient-1048k",                  \
                         choices=["gradientai/Llama-3-8B-Instruct-Gradient-1048k", "Qwen/Qwen2.5-7B-Instruct",               \
                         "Qwen/Qwen2.5-72B-Instruct", "meta-llama/Llama-3.1-8B-Instruct"], help="huggingface model name")
@@ -72,7 +72,7 @@ def generate_config(model_name, context_len, attn_type):
     n_clusters = lower if abs(n_clusters - lower) <= abs(n_clusters - upper) else upper
     nprobe = int(n_clusters*0.018)
 
-    if attn_type == 'RetroInfer':
+    if attn_type == 'RetroInfer' or attn_type == "FlashInfer":
         original_config[attn_type]['n_centroids'] = n_clusters
         original_config[attn_type]['n_segment'] = n_segments
         original_config[attn_type]['nprobe'] = nprobe
