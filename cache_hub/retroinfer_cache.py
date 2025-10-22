@@ -1103,6 +1103,8 @@ class retroinfer_cache(KV_Cache):
         Args:
             reset: if True, reset statistics after printing
         """
+        import matplotlib.pyplot as plt
+
         stats = self.get_prev_query_cluster_overlap_stats(reset=False)
 
         print("\n" + "="*100)
@@ -1111,6 +1113,9 @@ class retroinfer_cache(KV_Cache):
         print(f"{'Layer':<10} {'Samples':<12} {'Avg Overlap':<20} {'Overlap Rate':<20} {'nprobe':<10}")
         print("-"*100)
 
+        layers = []
+        overlap_rates = []
+
         for ldx in range(self.layer_num):
             layer_stats = stats[f'layer_{ldx}']
             if layer_stats['num_samples'] > 0:
@@ -1118,6 +1123,8 @@ class retroinfer_cache(KV_Cache):
                       f"{layer_stats['avg_overlap_per_sample']:<20.2f} "
                       f"{layer_stats['overlap_rate']:<19.2f}% "
                       f"{self.max_compute_cluster_num:<10}")
+                layers.append(ldx)
+                overlap_rates.append(layer_stats['overlap_rate'])
 
         print("="*100 + "\n")
 
@@ -1132,6 +1139,19 @@ class retroinfer_cache(KV_Cache):
             print(f"Average across all layers:")
             print(f"  Overlap Rate: {avg_overlap_rate:.2f}%")
             print(f"  Avg Overlap per Sample: {avg_overlap_per_sample:.2f} / {self.max_compute_cluster_num}\n")
+
+        # Plot overlap rate
+        if layers:
+            plt.figure(figsize=(10, 6))
+            plt.plot(layers, overlap_rates, marker='o', linewidth=2, markersize=6)
+            plt.xlabel('Layer', fontsize=12)
+            plt.ylabel('Overlap Rate (%)', fontsize=12)
+            plt.title('Cluster Overlap Rate by Layer (Using Previous Query)', fontsize=14)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig('plots/prev_query_cluster_overlap_rate.png', dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"Plot saved to: prev_query_cluster_overlap_rate.png\n")
 
         if reset:
             self.prev_query_cluster_overlap_stats = {
@@ -1240,6 +1260,8 @@ class retroinfer_cache(KV_Cache):
         Args:
             reset: if True, reset statistics after printing
         """
+        import matplotlib.pyplot as plt
+
         stats = self.get_query_similarity_stats(reset=False)
 
         print("\n" + "="*100)
@@ -1247,6 +1269,12 @@ class retroinfer_cache(KV_Cache):
         print("="*100)
         print(f"{'Layer':<8} {'Steps':<8} {'Cosine Sim (avg±std)':<25} {'Cosine Range':<20} {'L2 Dist (avg±std)':<25}")
         print("-"*100)
+
+        layers = []
+        cosine_means = []
+        cosine_stds = []
+        l2_means = []
+        l2_stds = []
 
         for ldx in range(self.layer_num):
             layer_stats = stats[f'layer_{ldx}']
@@ -1258,6 +1286,12 @@ class retroinfer_cache(KV_Cache):
                       f"{cos_stats['mean']:.4f}±{cos_stats['std']:.4f}        "
                       f"[{cos_stats['min']:.4f}, {cos_stats['max']:.4f}]      "
                       f"{l2_stats['mean']:.4f}±{l2_stats['std']:.4f}")
+
+                layers.append(ldx)
+                cosine_means.append(cos_stats['mean'])
+                cosine_stds.append(cos_stats['std'])
+                l2_means.append(l2_stats['mean'])
+                l2_stds.append(l2_stats['std'])
 
         print("="*100 + "\n")
 
@@ -1272,6 +1306,31 @@ class retroinfer_cache(KV_Cache):
             print(f"Average across all layers:")
             print(f"  Cosine Similarity: {np.mean(all_cosine):.4f}±{np.std(all_cosine):.4f}")
             print(f"  L2 Distance: {np.mean(all_l2):.4f}±{np.std(all_l2):.4f}\n")
+
+        # Plot similarities
+        if layers:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+            # Cosine similarity plot
+            ax1.errorbar(layers, cosine_means, yerr=cosine_stds, marker='o', linewidth=2,
+                        markersize=6, capsize=5, capthick=2)
+            ax1.set_xlabel('Layer', fontsize=12)
+            ax1.set_ylabel('Cosine Similarity', fontsize=12)
+            ax1.set_title('Query Cosine Similarity by Layer', fontsize=14)
+            ax1.grid(True, alpha=0.3)
+
+            # L2 distance plot
+            ax2.errorbar(layers, l2_means, yerr=l2_stds, marker='s', linewidth=2,
+                        markersize=6, capsize=5, capthick=2, color='orange')
+            ax2.set_xlabel('Layer', fontsize=12)
+            ax2.set_ylabel('L2 Distance', fontsize=12)
+            ax2.set_title('Query L2 Distance by Layer', fontsize=14)
+            ax2.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig('query_similarity_stats.png', dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"Plot saved to: query_similarity_stats.png\n")
 
         if reset:
             self.query_similarity_stats = {
@@ -1289,29 +1348,29 @@ class retroinfer_cache(KV_Cache):
         # assert queries.size(3) == self.head_dim
 
         # Calculate query similarity between consecutive decoding steps
-        # with torch.no_grad():
-        #     # queries shape: [batch_size, 1, num_heads, head_dim]
-        #     # Take first batch, first head (head 0) for similarity calculation
-        #     query_vector = queries[0, 0, 0, :].cpu()  # [head_dim]
+        with torch.no_grad():
+            # queries shape: [batch_size, 1, num_heads, head_dim]
+            # Take first batch, first head (head 0) for similarity calculation
+            query_vector = queries[0, 0, 0, :].cpu()  # [head_dim]
 
-        #     # Calculate similarity with previous query if available
-        #     if len(self.decode_queries[layer_idx]) > 0:
-        #         prev_query = torch.from_numpy(self.decode_queries[layer_idx][-1])
+            # Calculate similarity with previous query if available
+            if len(self.decode_queries[layer_idx]) > 0:
+                prev_query = torch.from_numpy(self.decode_queries[layer_idx][-1])
 
-        #         # Cosine similarity
-        #         cosine_sim = torch.nn.functional.cosine_similarity(
-        #             query_vector.unsqueeze(0),
-        #             prev_query.unsqueeze(0)
-        #         ).item()
-        #         self.query_similarity_stats['cosine_similarities'][layer_idx].append(cosine_sim)
+                # Cosine similarity
+                cosine_sim = torch.nn.functional.cosine_similarity(
+                    query_vector.unsqueeze(0),
+                    prev_query.unsqueeze(0)
+                ).item()
+                self.query_similarity_stats['cosine_similarities'][layer_idx].append(cosine_sim)
 
-        #         # L2 distance
-        #         l2_dist = torch.norm(query_vector - prev_query, p=2).item()
-        #         self.query_similarity_stats['l2_distances'][layer_idx].append(l2_dist)
+                # L2 distance
+                l2_dist = torch.norm(query_vector - prev_query, p=2).item()
+                self.query_similarity_stats['l2_distances'][layer_idx].append(l2_dist)
 
-        #     # Store query for visualization if enabled
-        #     if self.enable_prefill_visualization and len(self.decode_queries[layer_idx]) < self.max_decode_steps_to_visualize:
-        #         self.decode_queries[layer_idx].append(query_vector.numpy())
+            # Store query for visualization if enabled
+            if self.enable_prefill_visualization and len(self.decode_queries[layer_idx]) < self.max_decode_steps_to_visualize:
+                self.decode_queries[layer_idx].append(query_vector.numpy())
 
         torch.cuda.nvtx.range_push("kv_cache_compute")
         static_len = self.static_pattern_total if layer_idx == self.layer_num - 1 else self.static_pattern_total + 1

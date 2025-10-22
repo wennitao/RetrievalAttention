@@ -173,7 +173,7 @@ class LLM:
         # self.kv_cache.print_cache_stats(reset=True)
         # self.kv_cache.print_cluster_overlap_stats(reset=True)
         # self.kv_cache.print_query_similarity_stats(reset=True)
-        self.kv_cache.print_prev_query_cluster_overlap_stats(reset=True)
+        # self.kv_cache.print_prev_query_cluster_overlap_stats(reset=True)
         
         return logits
 
@@ -212,6 +212,8 @@ class LLM:
         
         outputs_ids = torch.cat(outputs_ids, dim=-1).tolist()
 
+        self.kv_cache.print_query_similarity_stats(reset=True)
+        self.kv_cache.print_prev_query_cluster_overlap_stats(reset=True)
         # self.kv_cache.generate_all_visualizations()
         
         return outputs_ids
