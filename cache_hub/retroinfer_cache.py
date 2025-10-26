@@ -263,7 +263,7 @@ class retroinfer_cache(KV_Cache):
             (self.kv_head, self.input_length-self.static_pattern_total, self.head_dim), 
             dtype=self.dtype, pin_memory=True
         ).contiguous()
-
+        
         # allocate pin memory to store organized keys & values in CPU
         self.list_keys = []
         self.list_values = []
@@ -279,6 +279,14 @@ class retroinfer_cache(KV_Cache):
         self.list_stride = self.input_length-self.static_pattern_total+self.input_length_new
         for ldx in range(self.layer_num):
             self.wave_buffer[ldx].set_kv(self.list_keys[ldx], self.list_values[ldx], self.offload_keys, self.offload_values)
+
+        # whitening
+        self.whitened_keys = []
+        for _ in range(self.layer_num):
+            self.whitened_keys.append(
+                torch.empty((self.batch_size, self.kv_head, self.input_length-self.static_pattern_total+self.input_length_new, self.head_dim),
+                            dtype=self.dtype, pin_memory=True).contiguous()
+            )
 
         # create multi-streams and events
         self.copystream = torch.cuda.Stream()
@@ -443,6 +451,12 @@ class retroinfer_cache(KV_Cache):
 
         print(f"\nAll visualizations saved to: {self.viz_save_dir}")
 
+    def plot_all_layer_clusters(self, batch_idx=0, head_idx=0):
+        for layer_idx in range(self.layer_num):
+            num_queries = len(self.decode_queries[layer_idx])
+            print(f"Layer {layer_idx}: {num_queries} decode queries captured")
+            self.plot_layer_clusters(layer_idx, batch_idx, head_idx)
+
     def plot_layer_clusters(self, layer_idx, batch_idx=0, head_idx=0):
         """
         Visualize key values and their centroids for a specific layer after prefill.
@@ -458,11 +472,14 @@ class retroinfer_cache(KV_Cache):
 
         with torch.no_grad():
             # Get centroids for this layer and head
-            centroids = self.centroids[layer_idx][batch_idx*self.kv_head + head_idx].cpu().numpy()  # [n_centroids, head_dim]
-            cluster_size = self.cluster_size[layer_idx][batch_idx*self.kv_head + head_idx].cpu().numpy()  # [n_centroids]
+            centroids = self.centroids[layer_idx][batch_idx*self.kv_head + head_idx].cpu().float().numpy()  # [n_centroids, head_dim]
+            cluster_size = self.cluster_size[layer_idx][batch_idx*self.kv_head + head_idx].cpu().float().numpy()  # [n_centroids]
 
             # Get key values for this layer and head
-            keys = self.list_keys[layer_idx][batch_idx, head_idx].cpu().numpy()  # [num_tokens, head_dim]
+            keys = self.list_keys[layer_idx][batch_idx, head_idx].cpu().float().numpy()  # [num_tokens, head_dim]
+
+            # Get whitened keys for this layer and head
+            whitened_keys = self.whitened_keys[layer_idx][batch_idx, head_idx].cpu().float().numpy()  # [num_tokens, head_dim]
 
             # Get decode queries if available
             queries_list = self.decode_queries[layer_idx]
@@ -473,9 +490,9 @@ class retroinfer_cache(KV_Cache):
             valid_centroids = centroids[valid_mask]
             valid_sizes = cluster_size[valid_mask]
 
-            # Use PCA to reduce to 2D
+            # Use PCA to reduce to 2D for original keys
             pca = PCA(n_components=2)
-            all_data = [keys, valid_centroids]
+            all_data = [keys]
             if has_queries:
                 queries = np.vstack(queries_list)  # [num_decode_steps, head_dim]
                 all_data.append(queries)
@@ -484,19 +501,27 @@ class retroinfer_cache(KV_Cache):
             reduced_all = pca.fit_transform(all_data_combined)
 
             keys_2d = reduced_all[:len(keys)]
-            centroids_2d = reduced_all[len(keys):len(keys)+len(valid_centroids)]
             if has_queries:
-                queries_2d = reduced_all[len(keys)+len(valid_centroids):]
+                queries_2d = reduced_all[len(keys):]
 
-            # Create visualization
-            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+            # Apply whitening to centroids to get them in whitened space
+            # The centroids are already computed on whitened keys, so they're in whitened space
+            # Just use them directly
+            whitened_centroids = valid_centroids  # Centroids are already in whitened space
 
-            # Plot 1: Keys, Centroids, and Decode Queries
+            # Use PCA for whitened keys and centroids together
+            pca_whitened = PCA(n_components=2)
+            whitened_all_data = np.vstack([whitened_keys, whitened_centroids])
+            whitened_all_2d = pca_whitened.fit_transform(whitened_all_data)
+            whitened_keys_2d = whitened_all_2d[:len(whitened_keys)]
+            whitened_centroids_2d = whitened_all_2d[len(whitened_keys):]
+
+            # Create visualization with 3 subplots
+            fig, axes = plt.subplots(1, 3, figsize=(24, 6))
+
+            # Plot 1: Keys and Decode Queries (no centroids)
             ax = axes[0]
             ax.scatter(keys_2d[:, 0], keys_2d[:, 1], alpha=0.3, s=10, c='lightblue', label='Key Vectors')
-            scatter = ax.scatter(centroids_2d[:, 0], centroids_2d[:, 1],
-                               s=valid_sizes * 3, c=valid_sizes, cmap='viridis',
-                               alpha=0.7, edgecolors='red', linewidth=2, label='Centroids')
 
             # Plot decode queries as a trajectory
             if has_queries:
@@ -507,20 +532,32 @@ class retroinfer_cache(KV_Cache):
                     ax.annotate(str(i), (x, y), fontsize=8, color='darkred',
                               xytext=(3, 3), textcoords='offset points')
 
-            cbar = plt.colorbar(scatter, ax=ax)
-            cbar.set_label('Cluster Size', rotation=270, labelpad=20)
             ax.set_xlabel('PCA Component 1')
             ax.set_ylabel('PCA Component 2')
-            title = f'Layer {layer_idx} Head {head_idx}: Keys & Centroids'
+            title = f'Layer {layer_idx} Head {head_idx}: Keys'
             if has_queries:
                 title += f' + {len(queries_list)} Decode Queries'
-            title += f'\n({len(keys)} keys, {valid_mask.sum()}/{len(centroids)} non-empty clusters)'
+            title += f'\n({len(keys)} keys)'
             ax.set_title(title)
             ax.legend()
             ax.grid(True, alpha=0.3)
 
-            # Plot 2: Cluster size distribution
+            # Plot 2: Whitened Keys with Centroids
             ax = axes[1]
+            ax.scatter(whitened_keys_2d[:, 0], whitened_keys_2d[:, 1], alpha=0.3, s=10, c='lightcoral', label='Whitened Keys')
+            scatter_w = ax.scatter(whitened_centroids_2d[:, 0], whitened_centroids_2d[:, 1],
+                                  s=valid_sizes * 3, c=valid_sizes, cmap='viridis',
+                                  alpha=0.7, edgecolors='darkred', linewidth=2, label='Centroids')
+            cbar_w = plt.colorbar(scatter_w, ax=ax)
+            cbar_w.set_label('Cluster Size', rotation=270, labelpad=20)
+            ax.set_xlabel('PCA Component 1')
+            ax.set_ylabel('PCA Component 2')
+            ax.set_title(f'Layer {layer_idx} Head {head_idx}: Whitened Keys & Centroids\n({len(whitened_keys)} keys, {valid_mask.sum()} clusters)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            # Plot 3: Cluster size distribution
+            ax = axes[2]
             ax.hist(valid_sizes, bins=30, color='skyblue', edgecolor='navy', alpha=0.7)
             ax.axvline(valid_sizes.mean(), color='red', linestyle='--', linewidth=2,
                       label=f'Mean: {valid_sizes.mean():.1f}')
@@ -702,7 +739,7 @@ class retroinfer_cache(KV_Cache):
             self.allocate_computation_buffer()
     
 
-    def prefill_update_kv_cache(self, query_states, key_states, value_states, layer_idx, batch_idx): 
+    def prefill_update_kv_cache(self, query_states, key_states, value_states, layer_idx, batch_idx, embed_keys_whitened=None): 
         """
         Prefill update the key & value cache for per batch for per layer
         Args:
@@ -732,6 +769,9 @@ class retroinfer_cache(KV_Cache):
         self.temp_values = value_states[0, valid_start+self.static_pattern_start:seq_len-self.static_pattern_end, :, :].transpose(0, 1).contiguous()
         self.mainevents[self.layer_mapping[str(layer_idx)]].record()
 
+        self.temp_whitened_keys = embed_keys_whitened[0, :, valid_start+self.static_pattern_start:seq_len-self.static_pattern_end, :].contiguous()
+        self.whitened_keys[layer_idx][batch_idx, :, :valid_length, :].copy_(embed_keys_whitened[0, :, valid_start+self.static_pattern_start:seq_len-self.static_pattern_end, :], non_blocking=True)
+
         # async offload keys & values to cpu
         with torch.cuda.stream(self.copystream):
             self.mainevents[self.layer_mapping[str(layer_idx)]].wait()
@@ -759,11 +799,21 @@ class retroinfer_cache(KV_Cache):
             num_centroids=self.n_centroids,
             num_segments=self.n_segment,
         )
+
+        # whitened segmented k-means
+        # _centroids, _value_sum, _clusters, _cluster_size = segment_k_means(
+        #     key=self.temp_whitened_keys,
+        #     value=self.temp_values,
+        #     num_centroids=self.n_centroids,
+        #     num_segments=self.n_segment,
+        # )
+
         # assert _centroids.shape[-2] == _value_sum.shape[-2] == _cluster_size.shape[-1] == _clusters.shape[-2] == self.n_centroids
         # print (_cluster_size)
 
         # copy meta index
         self.centroids[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :, :].copy_(_centroids + mean_key)         # (group_num, n_centroids, dim)
+        # self.centroids[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :, :].copy_(_centroids)
         self.value_sum[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :, :].copy_(_value_sum)                    # (group_num, n_centroids, dim)
         self.centroids_mask[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :].copy_(_cluster_size == 0)          # (group_num, n_centroids)
         self.cluster_size[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :].copy_(_cluster_size.to(self.dtype))  # (group_num, n_centroids)
@@ -1338,7 +1388,7 @@ class retroinfer_cache(KV_Cache):
                 'l2_distances': [[] for _ in range(self.layer_num)]
             }
 
-    def compute(self, queries, layer_idx, queries_next=None):
+    def compute(self, queries, layer_idx, queries_next=None, embed_queries=None):
         """
         queries: query vector, shape: (batch_size, 1, head_num, dim), gpu torch tensor
         """
@@ -1370,7 +1420,7 @@ class retroinfer_cache(KV_Cache):
 
             # Store query for visualization if enabled
             if self.enable_prefill_visualization and len(self.decode_queries[layer_idx]) < self.max_decode_steps_to_visualize:
-                self.decode_queries[layer_idx].append(query_vector.numpy())
+                self.decode_queries[layer_idx].append(query_vector.float().numpy())
 
         torch.cuda.nvtx.range_push("kv_cache_compute")
         static_len = self.static_pattern_total if layer_idx == self.layer_num - 1 else self.static_pattern_total + 1
@@ -1386,6 +1436,9 @@ class retroinfer_cache(KV_Cache):
             batch_gemm_softmax(queries, self.centroids[layer_idx], self.gemm_o, self.norm, self.sum, self.softmax_o,
                             self.batch_groups, self.group_size, self.n_centroids, self.head_dim,
                             self.RSQRT_DIM, 0)       # [batch_size*group_num, group_size, n_centroids]
+            # batch_gemm_softmax(embed_queries, self.centroids[layer_idx], self.gemm_o, self.norm, self.sum, self.softmax_o,
+            #                 self.batch_groups, self.group_size, self.n_centroids, self.head_dim,
+            #                 self.RSQRT_DIM, 0)       # [batch_size*group_num, group_size, n_centroids]
             dist = torch.sum(self.softmax_o, dim=1)     # [batch_size*group_num, n_centroids]
             dist.masked_fill_(self.centroids_mask[layer_idx], self.DTYPE_MIN)
             self.cI[buffer_idx] = torch.topk(dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True)[1] # [batch_size*group_num, max_consider_cluster]

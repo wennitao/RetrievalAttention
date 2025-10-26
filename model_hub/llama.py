@@ -1,3 +1,4 @@
+from typing import Optional
 import gc
 import re
 import os
@@ -10,7 +11,7 @@ from .LLM import LLM
 from cache_hub import flash_attn_cache, retroinfer_cache
 from attn_hub import prefill_full_flash_attn, decode_full_flash_attn, retroinfer_prefill_attn, retroinfer_decode_attn
 
-
+from cache_hub.whitening import WhiteningTransform
 
 class LlamaLayer:
     """
@@ -21,12 +22,55 @@ class LlamaLayer:
         self.layer_idx = layer_idx
         self.device = device
     
+    # whitening
+    @staticmethod
+    def QR_decomposition(Wk): # Wk: (num_key_value_heads, hidden_size, head_dim)
+        num_key_value_heads, hidden_size, head_dim = Wk.shape
+        Q, R = [], []
+        for head in range(num_key_value_heads):
+            q, r = torch.linalg.qr(Wk[head].float(), mode='reduced') # q: (hidden_size, head_dim), r: (head_dim, head_dim)
+            Q.append(q)
+            R.append(r)
+        Q = torch.stack(Q, dim=0) # (num_key_value_heads, hidden_size, head_dim)
+        R = torch.stack(R, dim=0) # (num_key_value_heads, head_dim, head_dim)
+        return Q, R
+
+    @torch.no_grad()
+    def init_svd_projection(self, k_proj_weight, rank: Optional[int] = None, tol: float = 1e-6):
+        # print (self.k_proj.weight.data.shape) # khead * dim, hidden_size
+        # hardcode for llama 3.1 8B
+        W_k = k_proj_weight.view(8, 128, 4096)
+        W_k = W_k.transpose(1, 2)
+        self.Qk, self.Rk = self.QR_decomposition(W_k) # (num_key_value_heads, hidden_size, head_dim), (num_key_value_heads, head_dim, head_dim)
+        self.query_transformation = self.Rk.transpose(-2, -1) # (num_key_value_heads, head_dim, head_dim)
+        self.query_transformation = self.query_transformation.repeat_interleave(4, dim=0) # (num_attention_heads, head_dim, head_dim)
+
+        # Initialize whitening transform
+        self.whitening = WhiteningTransform()
+
+    @torch.no_grad()
+    def estimate_key_covariance(self, phi_k: torch.Tensor):
+        """
+        Estimate covariance of φ_k(X) = X @ Q_k from sample inputs using robust Cholesky whitening.
+
+        Args:
+            phi_k: Tensor of shape (khead, num_samples, head_dim)
+                          Representative input samples for covariance estimation
+        """
+        if self.Qk is None:
+            raise ValueError("Must call init_svd_projection() before estimating covariance")
+
+        # Compute whitening transforms and expanded versions for queries
+        self.whitening.estimate_and_initialize(phi_k, 4)
+
     def init_layer(self, hf_llama_layer):
         self.wq = hf_llama_layer.self_attn.q_proj.weight.detach()
         self.wk = hf_llama_layer.self_attn.k_proj.weight.detach()
         self.wv = hf_llama_layer.self_attn.v_proj.weight.detach()
         self.wqkv = torch.cat((self.wq, self.wk, self.wv), dim=0).to(self.device, non_blocking=True)
         self.wo = hf_llama_layer.self_attn.o_proj.weight.detach().to(self.device, non_blocking=True)
+
+        self.init_svd_projection(self.wk.to(self.device), rank=64, tol=1e-6)
 
         self.wq_next = None
 
@@ -46,6 +90,12 @@ class LlamaLayer:
     def init_wq_next (self, wq_next):
         self.wq_next = wq_next.to(self.device, non_blocking=True)
 
+    def init_whitening(self, hidden_states):
+        batch_size, seq_len, dim = hidden_states.shape
+        embed_keys = torch.matmul(hidden_states, self.Qk.to(hidden_states.dtype))
+        self.estimate_key_covariance(embed_keys)
+        embed_keys = embed_keys.view(batch_size, 8, seq_len, 128)
+        return embed_keys
 
 class LlamaModel(LLM):
     """
@@ -209,7 +259,6 @@ class LlamaModel(LLM):
             self.kv_cache.enable_visualization()
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
-
     
     def move(self):
         torch.cuda.empty_cache()
@@ -259,7 +308,10 @@ class LlamaModel(LLM):
         if self.attention_type == 'Full_Flash_Attn':
             attn_out = decode_full_flash_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'RetroInfer':
-            attn_out = retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache, query_states_next)
+            batch_size, _, _, _ = query_states.shape
+            transform_weight = self.layers[layer_idx].query_transformation.unsqueeze(0).expand(batch_size, -1, -1, -1) # (batch_size, num_attention_heads, head_dim, head_dim)
+            embed_queries = torch.matmul(query_states.float(), transform_weight).to(self.dtype) # (batch_size, num_attention_heads, 1, head_dim)
+            attn_out = retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache, query_states_next, embed_queries)
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
         return attn_out

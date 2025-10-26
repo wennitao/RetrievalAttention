@@ -46,6 +46,11 @@ class LLM:
                                                                          layer.input_layernorm_weight)
         
         query_states, key_states, value_states = self.wqkv(temp_hidden_states, layer)
+
+        embed_keys = layer.init_whitening(temp_hidden_states)
+        embed_keys_whitened = layer.whitening.apply_whitening_to_keys(embed_keys)
+        print (embed_keys_whitened.shape)
+
         del temp_hidden_states
         torch.cuda.empty_cache()
         query_states, key_states = self.position_embedd(query_states, key_states)
@@ -54,7 +59,7 @@ class LLM:
         key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
-        key_states, value_states = self.kv_cache.prefill_update_kv_cache(query_states, key_states, value_states, layer_idx, start_bdx)
+        key_states, value_states = self.kv_cache.prefill_update_kv_cache(query_states, key_states, value_states, layer_idx, start_bdx, embed_keys_whitened)
         torch.cuda.empty_cache()
 
         temp_attn_out = self.prefill_attention(query_states, key_states, value_states)
@@ -212,9 +217,10 @@ class LLM:
         
         outputs_ids = torch.cat(outputs_ids, dim=-1).tolist()
 
-        self.kv_cache.print_query_similarity_stats(reset=True)
-        self.kv_cache.print_prev_query_cluster_overlap_stats(reset=True)
+        # self.kv_cache.print_query_similarity_stats(reset=True)
+        # self.kv_cache.print_prev_query_cluster_overlap_stats(reset=True)
         # self.kv_cache.generate_all_visualizations()
+        # self.kv_cache.plot_all_layer_clusters()
         
         return outputs_ids
 
