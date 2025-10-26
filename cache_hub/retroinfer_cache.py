@@ -112,7 +112,8 @@ class retroinfer_cache(KV_Cache):
         pages_per_cluster = math.ceil(avg_cluster_size / self.page_size)
         self.cache_size = cache_cluster_num * pages_per_cluster
         # enlarge these values may solve warning and error when decoding
-        self.buffer_size = max(int(self.nprobe * 4), 16) * pages_per_cluster
+        # self.buffer_size = max(int(self.nprobe * 4), 16) * pages_per_cluster
+        self.buffer_size = self.n_centroids * pages_per_cluster
 
         # whether to pre-allocate GPU buffer and cache before prefilling
         self.allocated = self.pre_allocate_decision()
@@ -793,27 +794,27 @@ class retroinfer_cache(KV_Cache):
         mean_key = torch.mean(self.temp_keys, dim=1, keepdim=True)
 
         # segmented k-means
-        _centroids, _value_sum, _clusters, _cluster_size = segment_k_means(
-            key=self.temp_keys-mean_key,    # centering to 0
-            value=self.temp_values,
-            num_centroids=self.n_centroids,
-            num_segments=self.n_segment,
-        )
-
-        # whitened segmented k-means
         # _centroids, _value_sum, _clusters, _cluster_size = segment_k_means(
-        #     key=self.temp_whitened_keys,
+        #     key=self.temp_keys-mean_key,    # centering to 0
         #     value=self.temp_values,
         #     num_centroids=self.n_centroids,
         #     num_segments=self.n_segment,
         # )
 
+        # whitened segmented k-means
+        _centroids, _value_sum, _clusters, _cluster_size = segment_k_means(
+            key=self.temp_whitened_keys,
+            value=self.temp_values,
+            num_centroids=self.n_centroids,
+            num_segments=self.n_segment,
+        )
+
         # assert _centroids.shape[-2] == _value_sum.shape[-2] == _cluster_size.shape[-1] == _clusters.shape[-2] == self.n_centroids
         # print (_cluster_size)
 
         # copy meta index
-        self.centroids[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :, :].copy_(_centroids + mean_key)         # (group_num, n_centroids, dim)
-        # self.centroids[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :, :].copy_(_centroids)
+        # self.centroids[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :, :].copy_(_centroids + mean_key)         # (group_num, n_centroids, dim)
+        self.centroids[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :, :].copy_(_centroids)
         self.value_sum[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :, :].copy_(_value_sum)                    # (group_num, n_centroids, dim)
         self.centroids_mask[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :].copy_(_cluster_size == 0)          # (group_num, n_centroids)
         self.cluster_size[layer_idx][batch_idx*self.kv_head:(batch_idx+1)*self.kv_head, :].copy_(_cluster_size.to(self.dtype))  # (group_num, n_centroids)
@@ -1433,12 +1434,12 @@ class retroinfer_cache(KV_Cache):
             torch.cuda.nvtx.range_push("search_topk_clusters")
             # search for TopK centroids
             # start = time.perf_counter()
-            batch_gemm_softmax(queries, self.centroids[layer_idx], self.gemm_o, self.norm, self.sum, self.softmax_o,
-                            self.batch_groups, self.group_size, self.n_centroids, self.head_dim,
-                            self.RSQRT_DIM, 0)       # [batch_size*group_num, group_size, n_centroids]
-            # batch_gemm_softmax(embed_queries, self.centroids[layer_idx], self.gemm_o, self.norm, self.sum, self.softmax_o,
+            # batch_gemm_softmax(queries, self.centroids[layer_idx], self.gemm_o, self.norm, self.sum, self.softmax_o,
             #                 self.batch_groups, self.group_size, self.n_centroids, self.head_dim,
             #                 self.RSQRT_DIM, 0)       # [batch_size*group_num, group_size, n_centroids]
+            batch_gemm_softmax(embed_queries, self.centroids[layer_idx], self.gemm_o, self.norm, self.sum, self.softmax_o,
+                            self.batch_groups, self.group_size, self.n_centroids, self.head_dim,
+                            self.RSQRT_DIM, 0)       # [batch_size*group_num, group_size, n_centroids]
             dist = torch.sum(self.softmax_o, dim=1)     # [batch_size*group_num, n_centroids]
             dist.masked_fill_(self.centroids_mask[layer_idx], self.DTYPE_MIN)
             self.cI[buffer_idx] = torch.topk(dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True)[1] # [batch_size*group_num, max_consider_cluster]
