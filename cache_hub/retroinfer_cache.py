@@ -335,6 +335,15 @@ class retroinfer_cache(KV_Cache):
         # Store previous queries (as tensors) for cluster selection simulation
         self.prev_queries = [None] * self.layer_num
 
+        # Page utilization statistics
+        self.page_utilization_stats = {
+            'total_full_pages': [0] * self.layer_num,
+            'total_partial_pages': [0] * self.layer_num,
+            'total_full_page_tokens': [0] * self.layer_num,
+            'total_partial_page_tokens': [0] * self.layer_num,
+            'num_decode_steps': [0] * self.layer_num,
+        }
+
     def enable_visualization(self, save_dir="plots/prefill_clusters"):
         """Enable visualization of key values and centroids during prefill."""
         self.enable_prefill_visualization = True
@@ -1192,14 +1201,224 @@ class retroinfer_cache(KV_Cache):
 
     def print_all_stats(self, reset=False):
         """
-        Print all statistics: cache, cluster overlap, and query similarity
+        Print all statistics: cache, cluster overlap, query similarity, and page utilization
         Args:
             reset: if True, reset statistics after printing
         """
         self.print_cache_stats(reset=False)
         self.print_cluster_overlap_stats(reset=False)
         self.print_prev_query_cluster_overlap_stats(reset=False)
+        self.print_page_utilization_stats(reset=False)
         self.print_query_similarity_stats(reset=reset)
+
+    def calculate_page_utilization_stats(self, layer_idx):
+        """
+        Calculate page utilization statistics for a specific layer during decode.
+        Tracks how many pages are full vs not full, and token distribution.
+
+        Args:
+            layer_idx: layer index to calculate stats for
+
+        Returns:
+            dict with page utilization statistics
+        """
+        # Get current miss unit sizes (retrieved from CPU during this decode step)
+        miss_sizes = self.miss_unit_sizes[layer_idx].cpu().numpy()  # [batch*kv_head, buffer_size]
+        miss_num = self.miss_num_units[layer_idx].cpu().numpy()  # [batch*kv_head]
+
+        # Get hit unit sizes (already in cache)
+        hit_sizes = self.hit_unit_sizes[layer_idx].cpu().numpy()  # [batch*kv_head, buffer_size]
+        hit_num = self.hit_num_units[layer_idx].cpu().numpy()  # [batch*kv_head]
+
+        stats = {
+            'full_pages': 0,
+            'partial_pages': 0,
+            'full_page_tokens': 0,
+            'partial_page_tokens': 0,
+            'total_pages': 0,
+            'total_tokens': 0,
+        }
+
+        # Process miss (CPU-retrieved) pages
+        for i in range(len(miss_num)):
+            num_units = int(miss_num[i])
+            for j in range(num_units):
+                page_size = int(miss_sizes[i, j])
+                if page_size > 0:
+                    stats['total_pages'] += 1
+                    stats['total_tokens'] += page_size
+                    if page_size == self.page_size:
+                        stats['full_pages'] += 1
+                        stats['full_page_tokens'] += page_size
+                    else:
+                        stats['partial_pages'] += 1
+                        stats['partial_page_tokens'] += page_size
+
+        # Process hit (cache-hit) pages
+        for i in range(len(hit_num)):
+            num_units = int(hit_num[i])
+            for j in range(num_units):
+                page_size = int(hit_sizes[i, j])
+                if page_size > 0:
+                    stats['total_pages'] += 1
+                    stats['total_tokens'] += page_size
+                    if page_size == self.page_size:
+                        stats['full_pages'] += 1
+                        stats['full_page_tokens'] += page_size
+                    else:
+                        stats['partial_pages'] += 1
+                        stats['partial_page_tokens'] += page_size
+
+        # Calculate ratios
+        if stats['total_pages'] > 0:
+            stats['full_page_ratio'] = stats['full_pages'] / stats['total_pages']
+            stats['partial_page_ratio'] = stats['partial_pages'] / stats['total_pages']
+        else:
+            stats['full_page_ratio'] = 0.0
+            stats['partial_page_ratio'] = 0.0
+
+        if stats['total_tokens'] > 0:
+            stats['full_page_token_ratio'] = stats['full_page_tokens'] / stats['total_tokens']
+            stats['partial_page_token_ratio'] = stats['partial_page_tokens'] / stats['total_tokens']
+        else:
+            stats['full_page_token_ratio'] = 0.0
+            stats['partial_page_token_ratio'] = 0.0
+
+        return stats
+
+    def update_page_utilization_stats(self, layer_idx):
+        """
+        Update cumulative page utilization statistics for a layer during decode.
+        Should be called after cache access in the compute() function.
+
+        Args:
+            layer_idx: layer index to update stats for
+        """
+        stats = self.calculate_page_utilization_stats(layer_idx)
+
+        self.page_utilization_stats['total_full_pages'][layer_idx] += stats['full_pages']
+        self.page_utilization_stats['total_partial_pages'][layer_idx] += stats['partial_pages']
+        self.page_utilization_stats['total_full_page_tokens'][layer_idx] += stats['full_page_tokens']
+        self.page_utilization_stats['total_partial_page_tokens'][layer_idx] += stats['partial_page_tokens']
+        self.page_utilization_stats['num_decode_steps'][layer_idx] += 1
+
+    def get_page_utilization_stats(self, reset=False):
+        """
+        Get accumulated page utilization statistics across all decode steps.
+
+        Args:
+            reset: if True, reset statistics after retrieval
+
+        Returns:
+            dict with per-layer page utilization statistics
+        """
+        stats = {}
+        for ldx in range(self.layer_num):
+            full_pages = self.page_utilization_stats['total_full_pages'][ldx]
+            partial_pages = self.page_utilization_stats['total_partial_pages'][ldx]
+            full_tokens = self.page_utilization_stats['total_full_page_tokens'][ldx]
+            partial_tokens = self.page_utilization_stats['total_partial_page_tokens'][ldx]
+            num_steps = self.page_utilization_stats['num_decode_steps'][ldx]
+
+            total_pages = full_pages + partial_pages
+            total_tokens = full_tokens + partial_tokens
+
+            stats[f'layer_{ldx}'] = {
+                'full_pages': full_pages,
+                'partial_pages': partial_pages,
+                'total_pages': total_pages,
+                'full_page_tokens': full_tokens,
+                'partial_page_tokens': partial_tokens,
+                'total_tokens': total_tokens,
+                'num_decode_steps': num_steps,
+                'full_page_ratio': (full_pages / total_pages * 100) if total_pages > 0 else 0.0,
+                'partial_page_ratio': (partial_pages / total_pages * 100) if total_pages > 0 else 0.0,
+                'full_page_token_ratio': (full_tokens / total_tokens * 100) if total_tokens > 0 else 0.0,
+                'partial_page_token_ratio': (partial_tokens / total_tokens * 100) if total_tokens > 0 else 0.0,
+                'avg_pages_per_step': (total_pages / num_steps) if num_steps > 0 else 0.0,
+            }
+
+        if reset:
+            self.page_utilization_stats = {
+                'total_full_pages': [0] * self.layer_num,
+                'total_partial_pages': [0] * self.layer_num,
+                'total_full_page_tokens': [0] * self.layer_num,
+                'total_partial_page_tokens': [0] * self.layer_num,
+                'num_decode_steps': [0] * self.layer_num,
+            }
+
+        return stats
+
+    def print_page_utilization_stats(self, reset=False):
+        """
+        Print page utilization statistics in a formatted table.
+
+        Args:
+            reset: if True, reset statistics after printing
+        """
+        stats = self.get_page_utilization_stats(reset=False)
+
+        print("\n" + "="*160)
+        print("Page Utilization Statistics (Decode Steps)")
+        print("="*160)
+        print(f"{'Layer':<8} {'Steps':<8} {'Full Pages':<12} {'Partial':<12} {'Full%':<10} "
+              f"{'Full Token%':<14} {'Avg Full Tok/Step':<18} {'Avg Partial Tok/Step':<20} {'Per Head':<12}")
+        print("-"*160)
+
+        for ldx in range(self.layer_num):
+            layer_stats = stats[f'layer_{ldx}']
+            if layer_stats['num_decode_steps'] > 0:
+                # Total tokens across all batch*kv_head groups
+                avg_full_tokens = layer_stats['full_page_tokens'] / layer_stats['num_decode_steps']
+                avg_partial_tokens = layer_stats['partial_page_tokens'] / layer_stats['num_decode_steps']
+                # Per head (divide by batch_size * kv_head)
+                avg_full_per_head = avg_full_tokens / (self.batch_size * self.kv_head)
+                avg_partial_per_head = avg_partial_tokens / (self.batch_size * self.kv_head)
+                avg_total_per_head = avg_full_per_head + avg_partial_per_head
+
+                print(f"{ldx:<8} {layer_stats['num_decode_steps']:<8} "
+                      f"{layer_stats['full_pages']:<12} {layer_stats['partial_pages']:<12} "
+                      f"{layer_stats['full_page_ratio']:<9.2f}% "
+                      f"{layer_stats['full_page_token_ratio']:<13.2f}% "
+                      f"{avg_full_tokens:<18.2f} {avg_partial_tokens:<20.2f} {avg_total_per_head:<12.2f}")
+
+        print("="*160 + "\n")
+
+        # Print summary
+        total_full = sum(self.page_utilization_stats['total_full_pages'])
+        total_partial = sum(self.page_utilization_stats['total_partial_pages'])
+        total_full_tokens = sum(self.page_utilization_stats['total_full_page_tokens'])
+        total_partial_tokens = sum(self.page_utilization_stats['total_partial_page_tokens'])
+        total_steps = sum(self.page_utilization_stats['num_decode_steps'])
+
+        total_all_pages = total_full + total_partial
+        total_all_tokens = total_full_tokens + total_partial_tokens
+
+        if total_all_pages > 0:
+            avg_full_tokens_per_step = total_full_tokens / total_steps if total_steps > 0 else 0
+            avg_partial_tokens_per_step = total_partial_tokens / total_steps if total_steps > 0 else 0
+            avg_total_tokens_per_step = total_all_tokens / total_steps if total_steps > 0 else 0
+
+            # Per head averages
+            avg_full_per_head = avg_full_tokens_per_step / (self.batch_size * self.kv_head)
+            avg_partial_per_head = avg_partial_tokens_per_step / (self.batch_size * self.kv_head)
+            avg_total_per_head = avg_total_tokens_per_step / (self.batch_size * self.kv_head)
+
+            print(f"Average across all layers:")
+            print(f"  Full Page Ratio: {total_full / total_all_pages * 100:.2f}% ({total_full}/{total_all_pages} pages)")
+            print(f"  Full Page Token Ratio: {total_full_tokens / total_all_tokens * 100:.2f}% ({total_full_tokens}/{total_all_tokens} tokens)")
+            print(f"  Avg Tokens per Decode Step (all heads): {avg_total_tokens_per_step:.2f} (Full: {avg_full_tokens_per_step:.2f}, Partial: {avg_partial_tokens_per_step:.2f})")
+            print(f"  Avg Tokens per Decode Step (per head): {avg_total_per_head:.2f} (Full: {avg_full_per_head:.2f}, Partial: {avg_partial_per_head:.2f})")
+            print(f"  Page size: {self.page_size}, Batch size: {self.batch_size}, KV heads: {self.kv_head}\n")
+
+        if reset:
+            self.page_utilization_stats = {
+                'total_full_pages': [0] * self.layer_num,
+                'total_partial_pages': [0] * self.layer_num,
+                'total_full_page_tokens': [0] * self.layer_num,
+                'total_partial_page_tokens': [0] * self.layer_num,
+                'num_decode_steps': [0] * self.layer_num,
+            }
 
     def get_query_similarity_stats(self, reset=False):
         """
@@ -1475,12 +1694,14 @@ class retroinfer_cache(KV_Cache):
             self.wave_buffer[layer_idx].batch_update()
             # Update statistics after cache access
             self.update_cache_stats(layer_idx)
+            self.update_page_utilization_stats(layer_idx)
         # estimation, next layer access sync
         if self.use_cluster_estimation and layer_idx > 1 and layer_idx < self.layer_num - 1:
             self.wave_buffer[layer_idx + 1].sync()
             self.wave_buffer[layer_idx].batch_update()
             # Update statistics after cache access
             self.update_cache_stats(layer_idx)
+            self.update_page_utilization_stats(layer_idx)
 
         # assemble the execution buffer
         # start = time.perf_counter()
@@ -1563,6 +1784,7 @@ class retroinfer_cache(KV_Cache):
             self.wave_buffer[layer_idx + 1].sync()
             # Update statistics for layer 2 when using cluster estimation at layer 1
             self.update_cache_stats(layer_idx + 1)
+            self.update_page_utilization_stats(layer_idx + 1)
 
             with torch.cuda.stream(self.copystream):
                 gather_copy_and_concat(self.steady_zone_keys[layer_idx + 1], self.list_keys[layer_idx + 1], self.cache_keys[layer_idx + 1], self.execution_buffer_keys[next_buffer_idx],

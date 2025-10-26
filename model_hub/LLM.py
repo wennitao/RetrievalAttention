@@ -212,9 +212,10 @@ class LLM:
         
         outputs_ids = torch.cat(outputs_ids, dim=-1).tolist()
 
-        self.kv_cache.print_query_similarity_stats(reset=True)
-        self.kv_cache.print_prev_query_cluster_overlap_stats(reset=True)
+        # self.kv_cache.print_query_similarity_stats(reset=True)
+        # self.kv_cache.print_prev_query_cluster_overlap_stats(reset=True)
         # self.kv_cache.generate_all_visualizations()
+        self.kv_cache.print_page_utilization_stats(reset=True)
         
         return outputs_ids
 
