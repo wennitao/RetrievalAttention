@@ -112,8 +112,8 @@ class retroinfer_cache(KV_Cache):
         pages_per_cluster = math.ceil(avg_cluster_size / self.page_size)
         self.cache_size = cache_cluster_num * pages_per_cluster
         # enlarge these values may solve warning and error when decoding
-        # self.buffer_size = max(int(self.nprobe * 4), 16) * pages_per_cluster
-        self.buffer_size = self.n_centroids * pages_per_cluster
+        self.buffer_size = max(int(self.nprobe * 4), 16) * pages_per_cluster
+        # self.buffer_size = self.n_centroids * pages_per_cluster
 
         # whether to pre-allocate GPU buffer and cache before prefilling
         self.allocated = self.pre_allocate_decision()

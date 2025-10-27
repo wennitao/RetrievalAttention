@@ -304,13 +304,13 @@ class LlamaModel(LLM):
         return attn_out
     
 
-    def decode_attention(self, query_states, key_states, value_states, layer_idx, query_states_next=None):
+    def decode_attention(self, query_states, key_states, value_states, layer_idx, query_states_next=None, pre_rope_query=None):
         if self.attention_type == 'Full_Flash_Attn':
             attn_out = decode_full_flash_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'RetroInfer':
             batch_size, _, _, _ = query_states.shape
             transform_weight = self.layers[layer_idx].query_transformation.unsqueeze(0).expand(batch_size, -1, -1, -1) # (batch_size, num_attention_heads, head_dim, head_dim)
-            embed_queries = torch.matmul(query_states.float(), transform_weight).to(self.dtype) # (batch_size, num_attention_heads, 1, head_dim)
+            embed_queries = torch.matmul(pre_rope_query.float(), transform_weight).to(self.dtype) # (batch_size, num_attention_heads, 1, head_dim)
             attn_out = retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache, query_states_next, embed_queries)
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
