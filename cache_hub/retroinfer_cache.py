@@ -764,6 +764,7 @@ class retroinfer_cache(KV_Cache):
             self.cI[buffer_idx] = torch.topk(dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True)[1] # [batch_size*group_num, max_consider_cluster]
             self.cluster_ids[buffer_idx].copy_(self.cI[buffer_idx][..., :self.nprobe])
             # print ("layer ", layer_idx, "selected clusters:", self.cluster_ids[layer_idx])
+            torch.cuda.synchronize()
             end = time.perf_counter()
             # print (f"layer {layer_idx} select clusters: {(end-start) * 1000:.4f} ms")
             select_clusters_time.append((end-start) * 1000)
@@ -823,7 +824,7 @@ class retroinfer_cache(KV_Cache):
                 self.es_cluster_size,    # [batch_size*group_num, 1, 1, es_cluster]
                 previous_out=None, previous_lse=None,
                 return_softmax_lse=True)
-            # torch.cuda.synchronize()
+            torch.cuda.synchronize()
             end = time.perf_counter()
             # print (f"layer {layer_idx} estimation zone flash attention: {(end-start) * 1000:.4f} ms")
             estimation_time.append((end-start) * 1000)
@@ -970,6 +971,7 @@ class retroinfer_cache(KV_Cache):
         self.cI[buffer_idx] = torch.topk(dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True)[1] # [batch_size*group_num, max_consider_cluster]
         self.cluster_ids[buffer_idx].copy_(self.cI[buffer_idx][..., :self.nprobe])
         # print ("layer ", layer_idx, "selected clusters:", self.cluster_ids[layer_idx])
+        torch.cuda.synchronize()
         end = time.perf_counter()
         # print (f"layer {layer_idx} select clusters: {(end-start) * 1000:.4f} ms")
         select_clusters_time.append((end-start) * 1000)
@@ -996,7 +998,7 @@ class retroinfer_cache(KV_Cache):
                 self.es_cluster_size,    # [batch_size*group_num, 1, 1, es_cluster]
                 previous_out=None, previous_lse=None,
                 return_softmax_lse=True)
-            # torch.cuda.synchronize()
+            torch.cuda.synchronize()
             end = time.perf_counter()
             # print (f"layer {layer_idx} estimation zone flash attention: {(end-start) * 1000:.4f} ms")
             estimation_time.append((end-start) * 1000)
@@ -1006,10 +1008,10 @@ class retroinfer_cache(KV_Cache):
 
         # flashinfer decode
         kv_page_indptr = torch.tensor (
-            [idx * self.nprobe for idx in range (self.batch_size + 1)], dtype=torch.int32, device="cuda:0"
+            [idx * self.nprobe * 2 for idx in range (self.batch_size + 1)], dtype=torch.int32
         )
-        kv_page_indices = torch.randperm(self.batch_size * self.cache_size, dtype=torch.int32, device="cuda:0")[:self.batch_size * self.nprobe]
-        kv_last_page_len = torch.full((self.batch_size, ), self.page_size, dtype=torch.int32, device="cuda:0")
+        kv_page_indices = torch.randperm(self.batch_size * self.cache_size, dtype=torch.int32)[:self.batch_size * self.nprobe * 2]
+        kv_last_page_len = torch.full((self.batch_size, ), self.page_size, dtype=torch.int32)
 
         start = time.perf_counter()
         self.decode_wrapper.plan (

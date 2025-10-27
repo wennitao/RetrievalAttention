@@ -115,6 +115,7 @@ class LLM:
 
         if estimate_next_query:
             query_states_next = query_states_next.view(bsz, -1, self.num_heads, self.head_dim)
+        torch.cuda.synchronize()
         end = time.perf_counter()
         qkv_time.append((end-start) * 1000)
 
@@ -134,6 +135,7 @@ class LLM:
         hidden_states = self.layernorm(hidden_states, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
         hidden_states = self.mlp(hidden_states, layer)
         hidden_states = residual + hidden_states
+        torch.cuda.synchronize()
         end = time.perf_counter()
         mlp_time.append((end-start) * 1000)
         torch.cuda.nvtx.range_pop()
