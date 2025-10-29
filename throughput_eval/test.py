@@ -5,11 +5,13 @@ import torch
 import argparse
 import random
 import numpy as np
+import time
 from termcolor import colored
 from transformers import AutoTokenizer
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(PROJECT_ROOT)
 from model_hub import LlamaModel, QwenModel
+from cache_hub import profiling
 
 
 def set_seed(seed):
@@ -34,6 +36,7 @@ def parse_args():
     parser.add_argument("--task_name", type=str, default="multivalue", choices=["NIAH", "fwe", "vt", "qa1", "test"],                \
                         help="Test task name")
     parser.add_argument("--use_cluster_estimation", action='store_true', help="Whether to use cluster estimation")
+    parser.add_argument("--no_use_cache", action='store_true', help="Whether to use GPU LRU Cache")
     args = parser.parse_args()
     
     return args
@@ -45,7 +48,8 @@ def load_model(model_name, max_len, dtype, device):
             max_length=max_len,
             dtype=dtype,
             device_map=device, 
-            use_cluster_estimation=args.use_cluster_estimation)
+            use_cluster_estimation=args.use_cluster_estimation, 
+            use_cache=not args.no_use_cache)
     elif 'Qwen' in model_name:
         llm = QwenModel(model_name,
             max_length=max_len,
@@ -76,7 +80,7 @@ def generate_config(model_name, context_len, attn_type):
         original_config[attn_type]['n_centroids'] = n_clusters
         original_config[attn_type]['n_segment'] = n_segments
         original_config[attn_type]['nprobe'] = nprobe
-        original_config[attn_type]['cache_cluster_num'] = nprobe * 3
+        original_config[attn_type]['cache_cluster_num'] = 0
         original_config[attn_type]['max_compute_cluster_num'] = int(n_clusters/4)
     
     if attn_type != "Full_Flash_Attn":
@@ -131,12 +135,46 @@ if __name__ == "__main__":
     print(colored(f"Input length: {input_len}", 'yellow'))
 
     llm = load_model(model_name, max_len, dtype, device)
-    out = llm.generate(attention_type=attn_type,
-        inputs_ids = input_ids.to(llm.layers[0].device),
-        attention_masks = attention_masks.to(llm.layers[0].device),
-        max_new_length=gen_len, attn_config=attn_config)
-    
+
+    # Warm up (3 rounds)
+    print(colored("Starting warmup (3 rounds)...", 'cyan'))
+    for iter in range(3):
+        out = llm.generate(attention_type=attn_type,
+            inputs_ids = input_ids.to(llm.layers[0].device),
+            attention_masks = attention_masks.to(llm.layers[0].device),
+            max_new_length=gen_len, attn_config=attn_config)
+        print(f"Warmup round {iter+1}/3 completed")
+
+    # Clear profiling data after warmup
+    print(colored("\nClearing profiling data...", 'cyan'))
+    profiling.select_clusters_time.clear()
+    profiling.estimation_time.clear()
+    profiling.gather_time.clear()
+    profiling.flash_attn_time.clear()
+    profiling.buffer_access_time.clear()
+    profiling.buffer_update_time.clear()
+    profiling.cache_update_time.clear()
+    profiling.mlp_time.clear()
+    profiling.attention_time.clear()
+    profiling.qkv_time.clear()
+    profiling.plan_time.clear()
+
+    # Benchmark (5 rounds for averaging)
+    print(colored("\nStarting benchmark (5 rounds)...", 'cyan'))
+    for iter in range(5):
+        out = llm.generate(attention_type=attn_type,
+            inputs_ids = input_ids.to(llm.layers[0].device),
+            attention_masks = attention_masks.to(llm.layers[0].device),
+            max_new_length=gen_len, attn_config=attn_config)
+        print(f"Benchmark round {iter+1}/5 completed")
+
+    print(colored("\n" + "="*70, 'green'))
+    print(colored("PROFILING RESULTS (averaged over 5 rounds)", 'green'))
+    print(colored("="*70 + "\n", 'green'))
+
     result = tokenizer.batch_decode(out, skip_special_tokens=True)
+    print(colored("Ground truth:", 'yellow'))
     print(groundtruth)
+    print(colored("\nGenerated output:", 'yellow'))
     print(result)
     

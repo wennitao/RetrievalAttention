@@ -123,6 +123,7 @@ class LLM:
         
         start = time.perf_counter()
         attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx, query_states_next)
+        torch.cuda.synchronize()
         end = time.perf_counter()
         attention_time.append((end-start) * 1000)
         
@@ -187,6 +188,38 @@ class LLM:
         
         return logits
 
+    def print_profiling(self, layer_latency, attention_latency):
+        print("Total profiling time statistics (ms):")
+        print(f"qkv computation time: {np.mean(qkv_time):.2f} ms")
+        print(f"Attention time: {np.mean(attention_time):.2f} ms")
+        print(f"MLP time: {np.mean(mlp_time):.2f} ms")
+        print()
+
+        print(f"Select clusters time: {np.mean(select_clusters_time):.2f} ms")
+        print(f"Estimation zone flash attention time: {np.mean(estimation_time):.2f} ms")
+        print(f"Buffer access sync time: {np.mean(buffer_access_time):.2f} ms")
+        print(f"KV copy time: {np.mean(kv_copy_time):.2f} ms")
+        print(f"Gather copy and concat time: {np.mean(gather_time):.2f} ms")
+        print(f"Buffer update sync time: {np.mean(buffer_update_time):.2f} ms")
+        print(f"Plan time: {np.mean(plan_time):.2f} ms")
+        print(f"Flash attention time: {np.mean(flash_attn_time):.2f} ms")
+        print(f"Merge time: {np.mean(merge_time):.2f} ms")
+        print(f"Cache update time: {np.mean(cache_update_time):.2f} ms")
+        print()
+
+        print(f"qkv computation time percentage: {np.mean(qkv_time) / layer_latency:.2f}%")
+        print(f"Attention time percentage: {np.mean(attention_time) / layer_latency:.2f}%")
+        print(f"MLP time percentage: {np.mean(mlp_time) / layer_latency:.2f}%")
+        print()
+
+        print(f"Select clusters time percentage: {np.mean(select_clusters_time) / attention_latency:.2f}%")
+        print(f"Estimation zone flash attention time percentage: {np.mean(estimation_time) / attention_latency:.2f}%")
+        print(f"Buffer access sync time percentage: {np.mean(buffer_access_time) / attention_latency:.2f}%")
+        print(f"Gather copy and concat time percentage: {np.mean(gather_time) / attention_latency:.2f}%")
+        print(f"Buffer update sync time percentage: {np.mean(buffer_update_time) / attention_latency:.2f}%")
+        print(f"Plan time percentage: {np.mean(plan_time) / attention_latency:.2f}%")
+        print(f"Flash attention time percentage: {np.mean(flash_attn_time) / attention_latency:.2f}%")
+        print(f"Cache update time percentage: {np.mean(cache_update_time) / attention_latency:.2f}%")
 
     def inference(self, inputs_ids):
         outputs_ids = []    # multi iteration, multi request
@@ -223,35 +256,7 @@ class LLM:
         layer_latency = (decode_end - decode_start) * 1000 / ((self.max_new_length - 1) * self.num_layers)
         attention_latency = np.mean(attention_time)
 
-        print("Total profiling time statistics (ms):")
-        print(f"qkv computation time: {np.mean(qkv_time):.2f} ms")
-        print(f"Attention time: {np.mean(attention_time):.2f} ms")
-        print(f"MLP time: {np.mean(mlp_time):.2f} ms")
-        print()
-
-        print(f"Select clusters time: {np.mean(select_clusters_time):.2f} ms")
-        print(f"Estimation zone flash attention time: {np.mean(estimation_time):.2f} ms")
-        print(f"Buffer access sync time: {np.mean(buffer_access_time):.2f} ms")
-        print(f"Gather copy and concat time: {np.mean(gather_time):.2f} ms")
-        print(f"Buffer update sync time: {np.mean(buffer_update_time):.2f} ms")
-        print(f"Plan time: {np.mean(plan_time):.2f} ms")
-        print(f"Flash attention time: {np.mean(flash_attn_time):.2f} ms")
-        print(f"Cache update time: {np.mean(cache_update_time):.2f} ms")
-        print()
-
-        print(f"qkv computation time percentage: {np.mean(qkv_time) / layer_latency:.2f}%")
-        print(f"Attention time percentage: {np.mean(attention_time) / layer_latency:.2f}%")
-        print(f"MLP time percentage: {np.mean(mlp_time) / layer_latency:.2f}%")
-        print()
-
-        print(f"Select clusters time percentage: {np.mean(select_clusters_time) / attention_latency:.2f}%")
-        print(f"Estimation zone flash attention time percentage: {np.mean(estimation_time) / attention_latency:.2f}%")
-        print(f"Buffer access sync time percentage: {np.mean(buffer_access_time) / attention_latency:.2f}%")
-        print(f"Gather copy and concat time percentage: {np.mean(gather_time) / attention_latency:.2f}%")
-        print(f"Buffer update sync time percentage: {np.mean(buffer_update_time) / attention_latency:.2f}%")
-        print(f"Plan time percentage: {np.mean(plan_time) / attention_latency:.2f}%")
-        print(f"Flash attention time percentage: {np.mean(flash_attn_time) / attention_latency:.2f}%")
-        print(f"Cache update time percentage: {np.mean(cache_update_time) / attention_latency:.2f}%")
+        self.print_profiling(layer_latency, attention_latency)
 
         outputs_ids = torch.cat(outputs_ids, dim=-1).tolist()
         

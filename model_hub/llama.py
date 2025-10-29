@@ -58,7 +58,8 @@ class LlamaModel(LLM):
         max_length: int,
         dtype: torch.dtype,
         device_map: str,
-        use_cluster_estimation: bool = False
+        use_cluster_estimation: bool = False,
+        use_cache: bool = True
     ) -> None:
         super().__init__(model_name, max_length, dtype, device_map)
 
@@ -74,6 +75,7 @@ class LlamaModel(LLM):
         self.vocab_size = self.config.vocab_size
         self.eos_tokens = [self.config.eos_token_id]
         self.use_cluster_estimation = use_cluster_estimation
+        self.use_cache = use_cache
 
         self.init_model()
 
@@ -204,7 +206,8 @@ class LlamaModel(LLM):
                 cache_cluster_num = retroinfer_config["cache_cluster_num"],
                 num_gpus = self.num_gpus,
                 model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)), 
-                use_cluster_estimation = self.use_cluster_estimation
+                use_cluster_estimation = self.use_cluster_estimation,
+                use_cache = self.use_cache
             )
 
             if self.attention_type == 'FlashInfer':
