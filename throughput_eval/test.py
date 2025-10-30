@@ -68,7 +68,7 @@ def generate_config(model_name, context_len, attn_type):
     with open(CONFIG_FILE, "r") as f:
         original_config = json.load(f)
     
-    n_clusters = max(int(context_len/16), 1)
+    n_clusters = max(int(context_len/32), 1)
     n_segments = max(int(context_len/8000), 1)
     # compute the nearest multiple of (n_segments*32)
     lower = (n_clusters // (n_segments*32)) * (n_segments*32)
@@ -81,7 +81,7 @@ def generate_config(model_name, context_len, attn_type):
         original_config[attn_type]['n_segment'] = n_segments
         original_config[attn_type]['nprobe'] = nprobe
         original_config[attn_type]['cache_cluster_num'] = 0
-        original_config[attn_type]['max_compute_cluster_num'] = int(n_clusters/4)
+        original_config[attn_type]['max_compute_cluster_num'] = int(n_clusters / 4)
     
     if attn_type != "Full_Flash_Attn":
         print(original_config[attn_type])
@@ -136,6 +136,17 @@ if __name__ == "__main__":
 
     llm = load_model(model_name, max_len, dtype, device)
 
+    out = llm.generate(attention_type=attn_type,
+            inputs_ids = input_ids.to(llm.layers[0].device),
+            attention_masks = attention_masks.to(llm.layers[0].device),
+            max_new_length=gen_len, attn_config=attn_config)
+    
+    result = tokenizer.batch_decode(out, skip_special_tokens=True)
+    print(colored("Ground truth:", 'yellow'))
+    print(groundtruth)
+    print(colored("\nGenerated output:", 'yellow'))
+    print(result)
+
     # Warm up (3 rounds)
     print(colored("Starting warmup (3 rounds)...", 'cyan'))
     for iter in range(3):
@@ -171,10 +182,3 @@ if __name__ == "__main__":
     print(colored("\n" + "="*70, 'green'))
     print(colored("PROFILING RESULTS (averaged over 5 rounds)", 'green'))
     print(colored("="*70 + "\n", 'green'))
-
-    result = tokenizer.batch_decode(out, skip_special_tokens=True)
-    print(colored("Ground truth:", 'yellow'))
-    print(groundtruth)
-    print(colored("\nGenerated output:", 'yellow'))
-    print(result)
-    

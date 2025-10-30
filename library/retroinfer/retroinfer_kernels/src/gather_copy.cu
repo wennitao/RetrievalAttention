@@ -8,7 +8,7 @@
 #include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
 
-#define CHUNK_SIZE 8        // number of vectors for one chunk
+#define CHUNK_SIZE 16        // number of vectors for one chunk
 #define DATA_BYTES 2        // input data type, 2 use bf16/fp16, 4 use fp32
 #define PTYPE int4          // int4 for 16 Bytes, int2 for 8 Bytes
 

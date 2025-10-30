@@ -966,28 +966,50 @@ class retroinfer_cache(KV_Cache):
         self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             self.workspace_buffer, "NHD"
         )
+        self.decode_scatter_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            self.workspace_buffer, "NHD"
+        )
 
-        self.paged_cache_size = self.batch_size * self.nprobe * 4
+        self.paged_cache_size = self.batch_size * self.kv_head * self.nprobe * 8
+        self.scattered_cache_size = self.batch_size * self.kv_head * self.nprobe * 8
 
         self.paged_key_cache = []
         self.paged_value_cache = []
+        self.scattered_key_cache = []
+        self.scattered_value_cache = []
         
         for ldx in range(self.layer_num):
             self.paged_key_cache.append(
-                torch.zeros((self.batch_size * self.paged_cache_size, self.page_size, self.kv_head, self.head_dim),
+                torch.zeros((self.paged_cache_size, self.page_size, 1, self.head_dim),
                             dtype=self.dtype, device="cuda:0").contiguous()
             )
             self.paged_value_cache.append(
-                torch.zeros((self.batch_size * self.paged_cache_size, self.page_size, self.kv_head, self.head_dim),
+                torch.zeros((self.paged_cache_size, self.page_size, 1, self.head_dim),
+                            dtype=self.dtype, device="cuda:0").contiguous()
+            )
+            self.scattered_key_cache.append(
+                torch.zeros((self.scattered_cache_size, 1, 1, self.head_dim),
+                            dtype=self.dtype, device="cuda:0").contiguous()
+            )
+            self.scattered_value_cache.append(
+                torch.zeros((self.scattered_cache_size, 1, 1, self.head_dim),
                             dtype=self.dtype, device="cuda:0").contiguous()
             )
 
+        selected_pages = int(self.nprobe / (self.n_centroids * 0.018) * 175)
+        selected_scatter_tokens = int(self.nprobe / (self.n_centroids * 0.018) * 478)
+
         self.kv_page_indptr = torch.tensor (
-            [idx * self.nprobe * 2 for idx in range (self.batch_size + 1)], dtype=torch.int32
+            [idx * selected_pages for idx in range (self.batch_size * self.kv_head + 1)], dtype=torch.int32
         )
-        self.kv_page_indices = torch.randperm(self.batch_size * self.paged_cache_size, dtype=torch.int32)[:self.batch_size * self.nprobe * 2]
-        self.kv_last_page_len = torch.full((self.batch_size, ), self.page_size, dtype=torch.int32)
-        
+        self.kv_page_indices = torch.randperm(self.paged_cache_size, dtype=torch.int32)[:self.batch_size * self.kv_head * selected_pages]
+        self.kv_last_page_len = torch.full((self.batch_size * self.kv_head, ), self.page_size, dtype=torch.int32)
+
+        self.kv_scatter_indptr = torch.tensor (
+            [idx * selected_scatter_tokens for idx in range (self.batch_size * self.kv_head + 1)], dtype=torch.int32
+        )
+        self.kv_scatter_indices = torch.randperm(self.scattered_cache_size, dtype=torch.int32)[:self.batch_size * self.kv_head * selected_scatter_tokens]
+        self.kv_last_scatter_len = torch.full((self.batch_size * self.kv_head, ), 1, dtype=torch.int32)
 
     def compute_flashinfer(self, queries, layer_idx):
         static_len = self.static_pattern_total if layer_idx == self.layer_num - 1 else self.static_pattern_total + 1
@@ -1050,10 +1072,22 @@ class retroinfer_cache(KV_Cache):
             self.kv_page_indptr,
             self.kv_page_indices,
             self.kv_last_page_len,
-            self.num_heads,
-            self.kv_head,
+            4,
+            1,
             self.head_dim,
             self.page_size,
+            pos_encoding_mode="NONE",
+            q_data_type=self.dtype,
+            kv_data_type=self.dtype,
+        )
+        self.decode_scatter_wrapper.plan (
+            self.kv_scatter_indptr,
+            self.kv_scatter_indices,
+            self.kv_last_scatter_len,
+            4,
+            1,
+            self.head_dim,
+            1,
             pos_encoding_mode="NONE",
             q_data_type=self.dtype,
             kv_data_type=self.dtype,
@@ -1061,7 +1095,7 @@ class retroinfer_cache(KV_Cache):
         end = time.perf_counter()
         plan_time.append((end-start) * 1000)
 
-        queries = queries.view(self.batch_size, self.num_heads, self.head_dim)
+        queries = queries.view(self.batch_size * self.kv_head, 4, self.head_dim)
 
         start = time.perf_counter()
         attn_out, lse_out = self.decode_wrapper.run(
@@ -1069,13 +1103,23 @@ class retroinfer_cache(KV_Cache):
             (self.paged_key_cache[layer_idx], self.paged_value_cache[layer_idx]),
             return_lse=True
         )
-        es_out = es_out.view (self.batch_size, self.num_heads, self.head_dim)
-        es_lse = es_lse.view (self.batch_size, self.num_heads)
+        attn_scatter_out, lse_scatter_out = self.decode_scatter_wrapper.run(
+            queries, 
+            (self.scattered_key_cache[layer_idx], self.scattered_value_cache[layer_idx]),
+            return_lse=True
+        )
         torch.cuda.synchronize()
         end = time.perf_counter()
         flash_attn_time.append((end-start) * 1000)
         start = time.perf_counter()
-        attn_out, _ = flashinfer.cascade.merge_state(es_out, es_lse, attn_out, lse_out)
+        es_out = es_out.view (self.batch_size, self.num_heads, self.head_dim)
+        es_lse = es_lse.view (self.batch_size, self.num_heads)
+        attn_out = attn_out.view (self.batch_size, self.num_heads, self.head_dim)
+        lse_out = lse_out.view (self.batch_size, self.num_heads)
+        attn_scatter_out = attn_scatter_out.view (self.batch_size, self.num_heads, self.head_dim)
+        lse_scatter_out = lse_scatter_out.view (self.batch_size, self.num_heads)
+        flashinfer.cascade.merge_state_in_place(attn_out, lse_out, es_out, es_lse)
+        flashinfer.cascade.merge_state_in_place(attn_out, lse_out, attn_scatter_out, lse_scatter_out)
         torch.cuda.synchronize()
         end = time.perf_counter()
         merge_time.append((end-start) * 1000)
