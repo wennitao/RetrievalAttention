@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct",                  \
                         choices=["gradientai/Llama-3-8B-Instruct-Gradient-1048k", "Qwen/Qwen2.5-7B-Instruct",               \
                         "Qwen/Qwen2.5-72B-Instruct", "meta-llama/Llama-3.1-8B-Instruct"], help="huggingface model name")
-    parser.add_argument("--task_name", type=str, default="multivalue", choices=["NIAH", "fwe", "vt", "qa1"],                \
+    parser.add_argument("--task_name", type=str, default="multivalue", choices=["NIAH", "fwe", "vt", "qa1", "test"],                \
                         help="Test task name")
     parser.add_argument("--use_cluster_estimation", action='store_true', help="Whether to use cluster estimation")
     args = parser.parse_args()
@@ -70,7 +70,7 @@ def generate_config(model_name, context_len, attn_type):
     lower = (n_clusters // (n_segments*32)) * (n_segments*32)
     upper = lower + (n_segments*32)
     n_clusters = lower if abs(n_clusters - lower) <= abs(n_clusters - upper) else upper
-    nprobe = int(n_clusters*0.1)
+    nprobe = int(n_clusters*0.018)
 
     if attn_type == 'RetroInfer':
         original_config[attn_type]['n_centroids'] = n_clusters
@@ -115,7 +115,7 @@ if __name__ == "__main__":
             data = json.load(f)[0]
         prompt = data['input']
         groundtruth = data['outputs']
-        attn_config = generate_config(model_name, 120000, attn_type)
+        attn_config = generate_config(model_name, args.context_len, attn_type)
     
     prompts = [prompt for _ in range(batch_size)]
     tokenizer = AutoTokenizer.from_pretrained(model_name)
