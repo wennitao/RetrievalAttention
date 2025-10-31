@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 from retroinfer_kernels import ThreadPool, WaveBufferCPU
 from retroinfer_kernels import gather_copy_and_concat, gather_copy_and_scatter, gather_copy_vectors, batch_gemm_softmax
@@ -41,7 +42,9 @@ class retroinfer_cache(KV_Cache):
         cache_cluster_num: int,
         num_gpus: int,
         model_size: int, 
-        use_cluster_estimation: bool = False
+        use_cluster_estimation: bool = False,
+        rope_cos_sin_cache: torch.Tensor = None,
+        enable_rope_correction: bool = True
     ) -> None:
         super().__init__(layer_num, batch_size, max_length, num_key_value_heads, num_heads, head_dim, dtype, layer_mapping, num_gpus, model_size)
         self.valid_start = valid_start
@@ -59,6 +62,55 @@ class retroinfer_cache(KV_Cache):
         self.dtype = dtype
 
         self.use_cluster_estimation = use_cluster_estimation
+        
+        # Store RoPE cos/sin cache for query smoothing
+        self.rope_cos_sin_cache = rope_cos_sin_cache
+        self.enable_rope_correction = enable_rope_correction
+        
+        # AR(1)/AR(2) prediction parameters
+        self.enable_ar_prediction = os.getenv("ENABLE_AR_PREDICTION", "0") == "1"
+        self.ar_alpha = float(os.getenv("AR_ALPHA", "1.0"))  # weight for current query
+        self.ar_beta = float(os.getenv("AR_BETA", "0.1"))    # weight for momentum term
+        # Optional AR(2) term - additional momentum on previous delta
+        self.ar_order = int(os.getenv("AR_ORDER", "1"))
+        self.ar_gamma = float(os.getenv("AR_GAMMA", "0.0"))  # second-order momentum term
+        # Lightweight on-the-fly ridge calibration for beta on neutral deltas
+        self.calibrate_ar = os.getenv("CALIBRATE_AR", "0") == "1"
+        self.ar_calib_window = int(os.getenv("AR_CALIB_WINDOW", "64"))
+        self.ar_calib_l2 = float(os.getenv("AR_CALIB_L2", "1e-3"))
+        self.ar_beta_min = float(os.getenv("AR_BETA_MIN", "0.0"))
+        self.ar_beta_max = float(os.getenv("AR_BETA_MAX", "0.3"))
+        # Per-layer calibration state
+        self.prev_delta_neutral = [None for _ in range(self.layer_num)]
+        self.ar_calib_num = [0.0 for _ in range(self.layer_num)]  # numerator accumulator
+        self.ar_calib_den = [0.0 for _ in range(self.layer_num)]  # denominator accumulator
+        self.ar_calib_steps = [0 for _ in range(self.layer_num)]
+        self.ar_calibrated = [False for _ in range(self.layer_num)]
+        
+        # Store previous queries for AR prediction (rotation-neutral space)
+        self.prev_queries_neutral = [None for _ in range(self.layer_num)]
+        self.prev_prev_queries_neutral = [None for _ in range(self.layer_num)]  # for AR(2)
+
+        # MLP predictor (residual) for neutral-space query prediction
+        self.enable_mlp_prediction = os.getenv("ENABLE_MLP_PREDICTION", "0") == "1"
+        self.mlp_weights_path = os.getenv("MLP_WEIGHTS_PATH", "")
+        self.mlp_input_mode = os.getenv("MLP_INPUT_MODE", "concat_delta")
+        self.mlp_apply_to_sim_only = os.getenv("MLP_APPLY_TO_SIM_ONLY", "1") == "1"
+        self.mlp_models = [None for _ in range(self.layer_num)]  # per-layer MLP
+        if self.enable_mlp_prediction and self.mlp_weights_path:
+            self._load_mlp_models()
+        
+        # Sample collection for MLP training
+        self.collect_samples = os.getenv("COLLECT_NEUTRAL_SAMPLES", "0") == "1"
+        self.sample_collector = None
+        if self.collect_samples:
+            try:
+                from tools.collect_neutral_samples import NeutralSampleCollector
+                max_samples = int(os.getenv("MAX_SAMPLES_PER_LAYER", "50000"))
+                self.sample_collector = NeutralSampleCollector(self.layer_num, self.head_dim, max_samples)
+            except ImportError:
+                print("Warning: Could not import NeutralSampleCollector; sample collection disabled.")
+                self.collect_samples = False
 
         self.input_length = self.max_length - max_new_length
         self.max_new_length = min(max_new_length-1, THRESHOLD_LENGTH)   # already generated one token when prefilling
@@ -285,6 +337,41 @@ class retroinfer_cache(KV_Cache):
             with torch.cuda.device(device_idx):
                 self.mainevents[device_idx] = torch.cuda.Event()
                 self.copyevents[device_idx] = torch.cuda.Event()
+
+        # query similarity instrumentation (optional, no behavior change)
+        # Enable by setting environment variable QUERY_SIM_LOG=1
+        self.sim_log_enabled = os.getenv("QUERY_SIM_LOG", "0") == "1"
+        base_logs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+        # Summary CSV only: per-token-pair, per-layer, mean/min/max/std over the H heads
+        self.sim_summary_path = os.getenv("QUERY_SIM_SUMMARY_PATH", os.path.join(base_logs_dir, "query_sim_qhead_summary.csv"))
+        self.prev_queries = [None for _ in range(self.layer_num)]  # store previous step queries per layer
+        self.layer_step = [0 for _ in range(self.layer_num)]       # per-layer decode step counter
+        if self.sim_log_enabled:
+            log_dir = os.path.dirname(self.sim_summary_path)
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+                # Prepare summary header
+                if not os.path.exists(self.sim_summary_path):
+                    with open(self.sim_summary_path, "w") as fsum:
+                        fsum.write("token_pair,layer,mean,min,max,std\n")
+                else:
+                    # If an older header exists, reset to the new header to avoid mixed formats
+                    try:
+                        with open(self.sim_summary_path, "r") as fsum:
+                            first = fsum.readline().strip()
+                        if first != "token_pair,layer,mean,min,max,std":
+                            with open(self.sim_summary_path, "w") as fsumw:
+                                fsumw.write("token_pair,layer,mean,min,max,std\n")
+                    except Exception:
+                        # If any issue reading, reset file to new header
+                        try:
+                            with open(self.sim_summary_path, "w") as fsumw:
+                                fsumw.write("token_pair,layer,mean,min,max,std\n")
+                        except Exception:
+                            pass
+            except Exception:
+                # If logging path can't be created, silently disable to avoid impacting inference
+                self.sim_log_enabled = False
     
     # decide whether to pre-allocate GPU memory before prefilling
     def pre_allocate_decision(self):
@@ -546,6 +633,110 @@ class retroinfer_cache(KV_Cache):
         if layer_idx == self.layer_num - 1:
             self.context += 1
             self.static_pattern_total += 1
+        
+        # Return key/value states to satisfy caller's expected interface
+        return key_states, value_states
+
+    
+    def _load_mlp_models(self):
+        """Load per-layer MLP models from checkpoint."""
+        import torch.nn as nn
+        
+        class ResidualMLP(nn.Module):
+            def __init__(self, input_dim, hidden_dim, output_dim):
+                super().__init__()
+                self.fc1 = nn.Linear(input_dim, hidden_dim)
+                self.relu = nn.ReLU()
+                self.fc2 = nn.Linear(hidden_dim, output_dim)
+                if input_dim != output_dim:
+                    self.residual_proj = nn.Linear(input_dim, output_dim, bias=False)
+                else:
+                    self.residual_proj = nn.Identity()
+            
+            def forward(self, x):
+                residual = self.residual_proj(x)
+                out = self.fc1(x)
+                out = self.relu(out)
+                out = self.fc2(out)
+                return out + residual
+        
+        # Try loading per-layer or global model
+        for layer_idx in range(self.layer_num):
+            # Check for per-layer checkpoint
+            layer_path = self.mlp_weights_path.replace('.pt', f'_layer{layer_idx}.pt')
+            if os.path.exists(layer_path):
+                ckpt = torch.load(layer_path, map_location='cpu')
+            elif os.path.exists(self.mlp_weights_path):
+                # Fall back to global model
+                ckpt = torch.load(self.mlp_weights_path, map_location='cpu')
+            else:
+                continue
+            
+            # Build model
+            model = ResidualMLP(ckpt['input_dim'], ckpt['hidden_dim'], ckpt['output_dim'])
+            model.load_state_dict(ckpt['model_state_dict'])
+            model.eval()
+            # Move to layer device
+            model = model.to(self.layer_mapping[str(layer_idx)], dtype=self.dtype)
+            self.mlp_models[layer_idx] = model
+            print(f"Loaded MLP for layer {layer_idx} from {layer_path if os.path.exists(layer_path) else self.mlp_weights_path}")
+    
+    def apply_rope_inverse(self, queries, position):
+        """
+        Apply inverse RoPE rotation R(-θ) to move queries to rotation-neutral space.
+        queries: [B, H, D]
+        position: scalar position index
+        Returns: queries in rotation-neutral space [B, H, D]
+        """
+        if self.rope_cos_sin_cache is None or position >= self.rope_cos_sin_cache.shape[0]:
+            return queries
+        
+        B, H, D = queries.shape
+        half_d = D // 2
+        
+        # Get cos/sin for the position (move the single row to the queries device/dtype)
+        cos_sin = self.rope_cos_sin_cache[position]
+        cos_sin = cos_sin.to(queries.device, dtype=queries.dtype, non_blocking=True)
+        cos_theta, sin_theta = cos_sin[:half_d], cos_sin[half_d:]
+        
+        # Reshape for rotation
+        q_reshape = queries.view(B, H, half_d, 2)
+        x1, x2 = q_reshape[..., 0], q_reshape[..., 1]
+        
+        # Apply R(-θ) = [[cos, sin], [-sin, cos]]
+        x1_neutral = cos_theta * x1 + sin_theta * x2
+        x2_neutral = -sin_theta * x1 + cos_theta * x2
+        
+        return torch.stack([x1_neutral, x2_neutral], dim=-1).view(B, H, D)
+    
+    
+    def apply_rope_forward(self, queries, position):
+        """
+        Apply forward RoPE rotation R(θ) from rotation-neutral space.
+        queries: [B, H, D] in rotation-neutral space
+        position: scalar position index
+        Returns: queries with RoPE applied [B, H, D]
+        """
+        if self.rope_cos_sin_cache is None or position >= self.rope_cos_sin_cache.shape[0]:
+            return queries
+        
+        B, H, D = queries.shape
+        half_d = D // 2
+        
+        # Get cos/sin for the position (move the single row to the queries device/dtype)
+        cos_sin = self.rope_cos_sin_cache[position]
+        cos_sin = cos_sin.to(queries.device, dtype=queries.dtype, non_blocking=True)
+        cos_theta, sin_theta = cos_sin[:half_d], cos_sin[half_d:]
+        
+        # Reshape for rotation
+        q_reshape = queries.view(B, H, half_d, 2)
+        x1, x2 = q_reshape[..., 0], q_reshape[..., 1]
+        
+        # Apply R(θ) = [[cos, -sin], [sin, cos]]
+        x1_rotated = cos_theta * x1 - sin_theta * x2
+        x2_rotated = sin_theta * x1 + cos_theta * x2
+        
+        return torch.stack([x1_rotated, x2_rotated], dim=-1).view(B, H, D)
 
         return None, None   # no use the return value
     
@@ -558,6 +749,193 @@ class retroinfer_cache(KV_Cache):
         # assert queries.size(1) == 1
         # assert queries.size(2) == self.kv_head * self.group_size == self.num_heads
         # assert queries.size(3) == self.head_dim
+        
+        # Residual MLP prediction in rotation-neutral space (optional, controlled by env)
+        if (self.enable_mlp_prediction or self.collect_samples) and hasattr(self, 'rope_cos_sin_cache') and self.rope_cos_sin_cache is not None:
+            B = queries.size(0)
+            cur_pos = self.context - 1 if layer_idx == self.layer_num - 1 else self.context
+            cur_pos = max(0, cur_pos)
+            
+            # Reshape queries to [B, H, D]
+            queries_orig = queries.view(B, self.num_heads, self.head_dim)
+            
+            # Unwind to rotation-neutral space
+            q_neutral_t = self.apply_rope_inverse(queries_orig, cur_pos)
+            
+            # Get previous neutral queries
+            prev_neutral = self.prev_queries_neutral[layer_idx]
+            prev_prev_neutral = self.prev_prev_queries_neutral[layer_idx]
+            
+            # Collect samples for training
+            if self.collect_samples and self.sample_collector and prev_neutral is not None:
+                # We have (prev_neutral, q_neutral_t); need q_next for triplet
+                # Store for next step collection (will be saved when q_{t+1} arrives)
+                pass
+            
+            # MLP prediction
+            if self.enable_mlp_prediction and self.mlp_models[layer_idx] is not None and prev_neutral is not None:
+                # Build input features based on mlp_input_mode
+                delta_cur = q_neutral_t - prev_neutral
+                if self.mlp_input_mode == 'concat':
+                    mlp_input = torch.cat([q_neutral_t, prev_neutral], dim=-1)  # [B, H, 2D]
+                elif self.mlp_input_mode == 'concat_delta':
+                    mlp_input = torch.cat([q_neutral_t, delta_cur], dim=-1)  # [B, H, 2D]
+                elif self.mlp_input_mode == 'delta_only':
+                    mlp_input = delta_cur  # [B, H, D]
+                else:
+                    mlp_input = torch.cat([q_neutral_t, delta_cur], dim=-1)
+                
+                # Flatten batch & heads for MLP: [B*H, input_dim]
+                mlp_input_flat = mlp_input.view(-1, mlp_input.shape[-1])
+                
+                # Predict delta: delta_pred = MLP(input) (residual is inside MLP)
+                with torch.no_grad():
+                    delta_pred = self.mlp_models[layer_idx](mlp_input_flat)  # [B*H, D]
+                
+                # Reconstruct predicted next query in neutral space
+                q_pred_neutral = q_neutral_t.view(-1, self.head_dim) + delta_pred
+                q_pred_neutral = q_pred_neutral.view(B, self.num_heads, self.head_dim)
+                
+                # Rewind to position t+1
+                q_pred_rotated = self.apply_rope_forward(q_pred_neutral, cur_pos + 1)
+                
+                # Replace queries (or only for sim logging if mlp_apply_to_sim_only=True)
+                if not self.mlp_apply_to_sim_only:
+                    queries = q_pred_rotated.view(B, 1, self.num_heads, self.head_dim)
+            
+            # Update history for next step (and sample collection)
+            if prev_neutral is not None and prev_prev_neutral is not None and self.collect_samples and self.sample_collector:
+                # Now we have triplet: (prev_prev, prev, cur) -> save
+                self.sample_collector.add_sample(layer_idx, prev_prev_neutral, prev_neutral, q_neutral_t)
+            
+            self.prev_prev_queries_neutral[layer_idx] = prev_neutral
+            self.prev_queries_neutral[layer_idx] = q_neutral_t.detach()
+
+        # Optional: measure cosine similarity between adjacent-step queries (per layer)
+        if self.sim_log_enabled:
+            try:
+                # Whitening for similarity logging is disabled; using RoPE-only corrections.
+
+                # reshape to [B, KV, G, D], and derive [B, H, D] for per-Query-head stats
+                B = queries.size(0)
+                q4d = queries.view(B, 1, self.num_heads, self.head_dim).squeeze(1)  # [B, H, D]
+                q4d = q4d.view(B, self.kv_head, self.group_size, self.head_dim).contiguous()  # [B, KV, G, D]
+                prev = self.prev_queries[layer_idx]
+                if prev is not None and prev.shape == q4d.shape:
+                    eps = 1e-6
+                    # token pair id for this step (compare step-1 & step)
+                    step = self.layer_step[layer_idx]
+                    if step > 0:
+                        token_pair = f"token{step-1}&{step}"
+                        # compute per-query-head cos: reshape prev/current to [B, H, D]
+                        prev_q = prev.view(B, self.kv_head * self.group_size, self.head_dim)  # [B, H, D]
+                        cur_q = q4d.view(B, self.kv_head * self.group_size, self.head_dim)    # [B, H, D]
+                        
+                        # Apply RoPE unwinding/rewinding correction:
+                        # For prev_q at position (step-1), apply rotation to position step
+                        # This removes the purely positional phase shift
+                        if self.enable_rope_correction and hasattr(self, 'rope_cos_sin_cache'):
+                            # Get cos/sin for positions step-1 and step
+                            pos_prev = self.context + step - 1
+                            pos_cur = self.context + step
+                            if pos_prev < self.rope_cos_sin_cache.shape[0] and pos_cur < self.rope_cos_sin_cache.shape[0]:
+                                # Extract cos and sin for both positions
+                                cos_sin_prev = self.rope_cos_sin_cache[pos_prev]  # [D]
+                                cos_sin_cur = self.rope_cos_sin_cache[pos_cur]    # [D]
+                                # Move to the same device/dtype as prev_q for safe ops
+                                cos_sin_prev = cos_sin_prev.to(prev_q.device, dtype=prev_q.dtype, non_blocking=True)
+                                cos_sin_cur = cos_sin_cur.to(prev_q.device, dtype=prev_q.dtype, non_blocking=True)
+                                half_d = self.head_dim // 2
+                                cos_prev, sin_prev = cos_sin_prev[:half_d], cos_sin_prev[half_d:]
+                                cos_cur, sin_cur = cos_sin_cur[:half_d], cos_sin_cur[half_d:]
+                                
+                                # Apply R(θ_{step}) R(-θ_{step-1}) to prev_q
+                                # First unwind: apply R(-θ_{step-1})
+                                prev_q_reshape = prev_q.view(B, self.kv_head * self.group_size, half_d, 2)  # [B, H, D/2, 2]
+                                x1_prev, x2_prev = prev_q_reshape[..., 0], prev_q_reshape[..., 1]
+                                # R(-θ) = [[cos, sin], [-sin, cos]]
+                                x1_unwound = cos_prev * x1_prev + sin_prev * x2_prev
+                                x2_unwound = -sin_prev * x1_prev + cos_prev * x2_prev
+                                
+                                # Then rewind: apply R(θ_{step})
+                                # R(θ) = [[cos, -sin], [sin, cos]]
+                                x1_rewound = cos_cur * x1_unwound - sin_cur * x2_unwound
+                                x2_rewound = sin_cur * x1_unwound + cos_cur * x2_unwound
+                                
+                                # Stack back
+                                prev_q_mod = torch.stack([x1_rewound, x2_rewound], dim=-1).view(B, self.kv_head * self.group_size, self.head_dim)
+                                prev_q = prev_q_mod
+                        
+                        # Optionally apply online remove-top-1-PC whitening to prev_q and cur_q
+                        if self.whiten_online:
+                            # operate on flattened [B*H, D]
+                            flat_prev = prev_q.view(-1, self.head_dim)
+                            flat_cur = cur_q.view(-1, self.head_dim)
+                            layer_mean = self.whiten_mean[layer_idx]
+                            pc = self.whiten_pc[layer_idx]
+                            # init if needed
+                            if layer_mean is None:
+                                layer_mean = flat_prev.mean(dim=0, keepdim=True)
+                                pc = torch.zeros((self.head_dim,), device=flat_prev.device, dtype=flat_prev.dtype)
+                                self.whiten_mean[layer_idx] = layer_mean
+                                self.whiten_pc[layer_idx] = pc
+
+                            # center
+                            flat_prev_c = flat_prev - layer_mean
+                            flat_cur_c = flat_cur - layer_mean
+
+                            # update running mean (very small step to avoid instability)
+                            # using simple exponential moving average
+                            decay = 1.0 - self.whiten_lr
+                            self.whiten_mean[layer_idx] = decay * layer_mean + self.whiten_lr * flat_prev.mean(dim=0, keepdim=True)
+
+                            # Oja update for top-1 PC: pc <- pc + lr * (x*(x·pc) - (pc)(x·x)) approximated
+                            # Simpler stable variant: pc += lr * (mean(x * (x@pc))) then normalize
+                            # compute projection of flat_prev_c on pc
+                            if pc.abs().sum() == 0:
+                                # initialize pc as first principal direction approx via mean
+                                # (avoid abs() which biases sign; use mean to capture common direction)
+                                pc = flat_prev_c.mean(dim=0).to(flat_prev.device)
+                            else:
+                                proj = torch.matmul(flat_prev_c, pc)
+                                update = (flat_prev_c * proj.unsqueeze(1)).mean(dim=0)
+                                pc = pc + self.whiten_lr * update
+                            # normalize pc
+                            pc_norm = pc.norm(p=2)
+                            if pc_norm > 0:
+                                pc = pc / pc_norm
+                            self.whiten_pc[layer_idx] = pc
+
+                            # increment step counter and only remove the component after warmup
+                            self.whiten_steps[layer_idx] += 1
+                            if self.whiten_steps[layer_idx] >= self.whiten_min_steps:
+                                # remove top-1 component: x' = x - (x·pc) pc
+                                proj_prev = torch.matmul(flat_prev_c, pc)
+                                proj_cur = torch.matmul(flat_cur_c, pc)
+                                flat_prev_c = flat_prev_c - proj_prev.unsqueeze(1) * pc.unsqueeze(0)
+                                flat_cur_c = flat_cur_c - proj_cur.unsqueeze(1) * pc.unsqueeze(0)
+
+                            # reshape back
+                            prev_q = flat_prev_c.view(prev_q.shape)
+                            cur_q = flat_cur_c.view(cur_q.shape)
+
+                        num = (cur_q * prev_q).sum(dim=-1)  # [B, H]
+                        denom = (cur_q.norm(dim=-1) * prev_q.norm(dim=-1)).clamp_min(eps)
+                        cos_h = (num / denom).clamp(-1.0, 1.0).detach().float()  # [B, H]
+                        # Aggregate across batch, then summarize across heads in one row
+                        cos_h_mean = cos_h.mean(dim=0)  # [H]
+                        overall_mean = cos_h_mean.mean().item()
+                        overall_min = cos_h_mean.min().item()
+                        overall_max = cos_h_mean.max().item()
+                        overall_std = cos_h_mean.std(unbiased=False).item()
+                        with open(self.sim_summary_path, "a") as fsum:
+                            fsum.write(f"{token_pair},{layer_idx+1},{overall_mean:.4f},{overall_min:.4f},{overall_max:.4f},{overall_std:.4f}\n")
+                # update previous to current
+                self.prev_queries[layer_idx] = q4d.detach()
+                self.layer_step[layer_idx] += 1
+            except Exception:
+                # Never let logging break inference
+                pass
 
         torch.cuda.nvtx.range_push("kv_cache_compute")
         static_len = self.static_pattern_total if layer_idx == self.layer_num - 1 else self.static_pattern_total + 1
@@ -740,3 +1118,9 @@ class retroinfer_cache(KV_Cache):
         torch.cuda.nvtx.range_pop()
 
         return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
+    
+    def save_collected_samples(self):
+        """Save collected neutral-space samples to disk (call at end of inference)."""
+        if self.collect_samples and self.sample_collector:
+            self.sample_collector.save_all()
+

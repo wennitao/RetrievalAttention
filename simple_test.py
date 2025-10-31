@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"], help="Dtype")
     parser.add_argument("--attn_type", type=str, default="RetroInfer",                                                      \
                         choices=["Full_Flash_Attn", "RetroInfer"], help="Attention method")
-    parser.add_argument("--model_name", type=str, default="gradientai/Llama-3-8B-Instruct-Gradient-1048k",                  \
+    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct",                  \
                         choices=["gradientai/Llama-3-8B-Instruct-Gradient-1048k", "Qwen/Qwen2.5-7B-Instruct",               \
                         "Qwen/Qwen2.5-72B-Instruct", "meta-llama/Llama-3.1-8B-Instruct"], help="huggingface model name")
     parser.add_argument("--data_path", type=str, default="", help="Input json file path")

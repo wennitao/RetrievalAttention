@@ -236,5 +236,10 @@ class LLM:
         self.init_kv_cache(input_length, valid_start, attn_config)
 
         outputs = self.inference(inputs_ids)
+        
+        # Save collected samples if sample collection is enabled
+        if hasattr(self.kv_cache, 'save_collected_samples'):
+            self.kv_cache.save_collected_samples()
 
         return outputs
+

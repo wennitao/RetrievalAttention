@@ -215,6 +215,7 @@ class QwenModel(LLM):
         elif self.attention_type == 'RetroInfer':
             retroinfer_config = qwen_config.get(self.attention_type)
 
+            enable_rope_correction = os.getenv("ROPE_CORRECTION", "1") == "1"
             self.kv_cache = retroinfer_cache(
                 valid_start = valid_start,
                 layer_num = self.num_layers,
@@ -236,7 +237,9 @@ class QwenModel(LLM):
                 cache_unit_size = retroinfer_config["cache_unit_size"],
                 cache_cluster_num = retroinfer_config["cache_cluster_num"],
                 num_gpus = self.num_gpus,
-                model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1))
+                model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),
+                rope_cos_sin_cache = self.cos_sin_cache,
+                enable_rope_correction = enable_rope_correction
             )
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
