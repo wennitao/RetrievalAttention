@@ -875,6 +875,15 @@ class retroinfer_cache(KV_Cache):
             # print (self.list_keys[layer_idx].device, self.cache_keys[layer_idx].device, self.execution_buffer_keys.device)
             # print ("hit ", torch.sum (self.hit_unit_sizes[layer_idx], dim=1))
             # print ("miss ", torch.sum (self.miss_unit_sizes[layer_idx], dim=1))
+            # print("Layer ", layer_idx, " gather copy and concat:")
+            # print(self.miss_unit_idices[layer_idx])
+            # print(self.miss_unit_sizes[layer_idx])
+            # print(self.miss_num_units[layer_idx])
+
+            # print(self.hit_unit_idices[layer_idx])
+            # print(self.hit_unit_sizes[layer_idx])
+            # print(self.hit_num_units[layer_idx])
+
             torch.cuda.nvtx.range_push("current_layer_copy")
             gather_copy_and_concat(self.steady_zone_keys[layer_idx], self.device_list_key, self.cache_keys[layer_idx], self.execution_buffer_keys[buffer_idx],
                                 self.steady_zone_values[layer_idx], self.device_list_value, self.cache_values[layer_idx], self.execution_buffer_values[buffer_idx],
@@ -905,6 +914,8 @@ class retroinfer_cache(KV_Cache):
             torch.cuda.nvtx.range_push("next_layer_access")
             self.wave_buffer[layer_idx + 1].batch_access()
             torch.cuda.nvtx.range_pop()
+
+        # print (self.valid_lengths[buffer_idx])
 
         # flash attention for retrieve zone and steady zone, merge the estimation zone results at the same time
         torch.cuda.nvtx.range_push("flash_attention")
@@ -996,8 +1007,8 @@ class retroinfer_cache(KV_Cache):
                             dtype=self.dtype, device="cuda:0").contiguous()
             )
 
-        selected_pages = int(self.nprobe / (self.n_centroids * 0.018) * 175)
-        selected_scatter_tokens = int(self.nprobe / (self.n_centroids * 0.018) * 478)
+        selected_pages = int(self.nprobe / int(self.n_centroids * 0.018) * 88)
+        selected_scatter_tokens = int(self.nprobe / int(self.n_centroids * 0.018) * 510)
 
         self.kv_page_indptr = torch.tensor (
             [idx * selected_pages for idx in range (self.batch_size * self.kv_head + 1)], dtype=torch.int32
@@ -1010,6 +1021,10 @@ class retroinfer_cache(KV_Cache):
         )
         self.kv_scatter_indices = torch.randperm(self.scattered_cache_size, dtype=torch.int32)[:self.batch_size * self.kv_head * selected_scatter_tokens]
         self.kv_last_scatter_len = torch.full((self.batch_size * self.kv_head, ), 1, dtype=torch.int32)
+
+        print ("Page size:", self.page_size)
+        print ("Selected pages per head:", selected_pages)
+        print ("Selected scatter tokens per head:", selected_scatter_tokens)
 
     def compute_flashinfer(self, queries, layer_idx):
         static_len = self.static_pattern_total if layer_idx == self.layer_num - 1 else self.static_pattern_total + 1

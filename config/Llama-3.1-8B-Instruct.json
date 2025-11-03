@@ -7,7 +7,7 @@
         "n_segment": 16,
         "nprobe": 300,
         "max_compute_cluster_num": 2048,
-        "cache_unit_size": 16,
+        "cache_unit_size": 8,
         "cache_cluster_num": 450
     },
     "FlashInfer": {
@@ -18,7 +18,7 @@
         "n_segment": 16,
         "nprobe": 300,
         "max_compute_cluster_num": 2048,
-        "cache_unit_size": 16,
+        "cache_unit_size": 8,
         "cache_cluster_num": 450
     }
 }

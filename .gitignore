@@ -410,3 +410,4 @@ throughput_eval/cluster_data
 throughput_eval/cluster_plots
 *.nsys-rep
 *.ncu-rep
+*.png
