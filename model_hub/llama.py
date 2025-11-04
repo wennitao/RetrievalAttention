@@ -23,11 +23,16 @@ class QuerySimilarityLogger:
         self.batch_size = 1
         self.prev_queries = {}
         self.decode_token_counts = {}
+        self.rope_applier = None
 
     def set_batch_size(self, batch_size: int) -> None:
         self.batch_size = batch_size
         self.prev_queries.clear()
         self.decode_token_counts.clear()
+
+    def set_rope_applier(self, rope_applier_fn) -> None:
+        """Set the RoPE application function from the model."""
+        self.rope_applier = rope_applier_fn
 
     def _ensure_open(self) -> None:
         if self.file_handle is not None:
@@ -44,34 +49,64 @@ class QuerySimilarityLogger:
     def _should_log_pair(self, prev_token_idx: int) -> bool:
         return self.max_pairs is None or self.max_pairs < 0 or prev_token_idx < self.max_pairs
 
-    def record_decode(self, layer_idx: int, query_states: torch.Tensor, sample_offset: int = 0) -> None:
-        if query_states.numel() == 0:
+    def record_decode(self, layer_idx: int, query_states_no_rope: torch.Tensor, current_position: int, sample_offset: int = 0) -> None:
+        """
+        Record similarity between prev query with current RoPE and current query with current RoPE.
+
+        Args:
+            layer_idx: Layer index
+            query_states_no_rope: Query states WITHOUT RoPE applied, shape [bsz, seq_len, num_heads, head_dim]
+            current_position: Current token position for RoPE
+            sample_offset: Offset for sample ID in batch
+        """
+        if query_states_no_rope.numel() == 0:
             return
 
         self._ensure_open()
-        normalized = F.normalize(query_states.detach().to(torch.float32), dim=-1, eps=1e-6)
-        bsz, seq_len, _, _ = normalized.shape
+        bsz, seq_len, num_heads, head_dim = query_states_no_rope.shape
 
         for batch_idx in range(bsz):
             sample_id = sample_offset + batch_idx
             prefix = "" if self.batch_size == 1 else f"sample{sample_id}_"
             key = (layer_idx, sample_id)
-            prev = self.prev_queries.get(key)
+            prev_query_no_rope = self.prev_queries.get(key)
             prev_idx = self.decode_token_counts.get(key, -1)
 
             for pos in range(seq_len):
-                current = normalized[batch_idx, pos]
+                current_query_no_rope = query_states_no_rope[batch_idx, pos]  # [num_heads, head_dim]
+                current_pos_global = current_position + pos
 
-                if prev is None:
-                    self.prev_queries[key] = current.clone()
+                if prev_query_no_rope is None:
+                    # Store the no-rope version
+                    self.prev_queries[key] = current_query_no_rope.clone()
                     self.decode_token_counts[key] = 0
-                    prev = self.prev_queries[key]
+                    prev_query_no_rope = self.prev_queries[key]
                     prev_idx = 0
                     continue
 
                 current_idx = prev_idx + 1
                 if self._should_log_pair(prev_idx):
-                    sims = (prev * current).sum(dim=-1)
+                    # Apply RoPE to both prev and current query with CURRENT position
+                    if self.rope_applier is not None:
+                        prev_query_with_rope = self.rope_applier(
+                            prev_query_no_rope.unsqueeze(0).unsqueeze(0),  # [1, 1, num_heads, head_dim]
+                            current_pos_global
+                        ).squeeze(0).squeeze(0)  # [num_heads, head_dim]
+
+                        current_query_with_rope = self.rope_applier(
+                            current_query_no_rope.unsqueeze(0).unsqueeze(0),  # [1, 1, num_heads, head_dim]
+                            current_pos_global
+                        ).squeeze(0).squeeze(0)  # [num_heads, head_dim]
+
+                        # Normalize and compute similarity
+                        prev_normalized = F.normalize(prev_query_with_rope.detach().to(torch.float32), dim=-1, eps=1e-6)
+                        current_normalized = F.normalize(current_query_with_rope.detach().to(torch.float32), dim=-1, eps=1e-6)
+                    else:
+                        # Fallback: use no-rope queries if rope_applier is not set
+                        prev_normalized = F.normalize(prev_query_no_rope.detach().to(torch.float32), dim=-1, eps=1e-6)
+                        current_normalized = F.normalize(current_query_no_rope.detach().to(torch.float32), dim=-1, eps=1e-6)
+
+                    sims = (prev_normalized * current_normalized).sum(dim=-1)
                     mean = sims.mean().item()
                     minv = sims.min().item()
                     maxv = sims.max().item()
@@ -86,9 +121,10 @@ class QuerySimilarityLogger:
                         f"{stdv:.4f}",
                     ])
 
-                self.prev_queries[key] = current.clone()
+                # Store current query WITHOUT RoPE for next iteration
+                self.prev_queries[key] = current_query_no_rope.clone()
                 self.decode_token_counts[key] = current_idx
-                prev = self.prev_queries[key]
+                prev_query_no_rope = self.prev_queries[key]
                 prev_idx = current_idx
 
     def close(self) -> None:
@@ -253,6 +289,10 @@ class LlamaModel(LLM):
         del self.inv_freq, self.cos_cache, self.sin_cache
         gc.collect()
         torch.cuda.empty_cache()
+
+        # Set RoPE applier for query similarity logger
+        if self.query_similarity_logger is not None:
+            self.query_similarity_logger.set_rope_applier(self.apply_rope_for_logger)
 
 
     def init_kv_cache(self, real_input_length, valid_start, attn_config=None):
@@ -430,6 +470,41 @@ class LlamaModel(LLM):
         flashinfer.rope.apply_rope_with_cos_sin_cache_inplace(position_ids, query_states, key_states_temp, self.head_dim, self.cos_sin_cache, False)
         query_states = query_states.view(bsz, -1, hidden_dim)
         return query_states
+
+    def apply_rope_for_logger(self, query_states, position):
+        """
+        Apply RoPE to query states for a single position (used by QuerySimilarityLogger).
+
+        Args:
+            query_states: shape [bsz, seq_len, num_heads, head_dim]
+            position: integer position
+
+        Returns:
+            query_states with RoPE applied (new tensor, not in-place)
+        """
+        bsz, seq_len, num_heads, head_dim = query_states.shape
+        hidden_dim = num_heads * head_dim
+
+        # Clone and reshape to [bsz, seq_len, hidden_dim]
+        query_states_copy = query_states.clone().reshape(bsz, seq_len, hidden_dim)
+
+        # Create position_ids as [bsz, seq_len] filled with the same position
+        position_ids = torch.full((bsz, seq_len), position, device=query_states.device, dtype=torch.long)
+
+        # Apply RoPE (this will flatten position_ids internally)
+        query_states_rope = query_states_copy.view(-1, hidden_dim)
+        key_states_temp = torch.zeros_like(query_states_rope)
+        position_ids_flat = position_ids.view(-1)
+
+        # Apply RoPE in-place
+        flashinfer.rope.apply_rope_with_cos_sin_cache_inplace(
+            position_ids_flat, query_states_rope, key_states_temp,
+            self.head_dim, self.cos_sin_cache, False
+        )
+
+        # Reshape back
+        query_states_rope = query_states_rope.view(bsz, seq_len, num_heads, head_dim)
+        return query_states_rope
 
     def position_embedd(self, query_states, key_states):
         bsz, seq_len, _ = key_states.shape

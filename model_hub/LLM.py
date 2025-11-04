@@ -95,8 +95,13 @@ class LLM:
         layer = self.layers[layer_idx]
 
         hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
-        
+
         query_states, key_states, value_states = self.wqkv(hidden_states, layer)
+
+        # Store query states without RoPE for similarity logging
+        query_states_no_rope = query_states.view(bsz, -1, self.num_heads, self.head_dim).clone()
+        current_position = self.kv_cache.context
+
         query_states, key_states = self.position_embedd(query_states, key_states)
 
         estimate_next_query = self.use_cluster_estimation and layer_idx > 1 and layer.wq_next is not None
@@ -115,7 +120,7 @@ class LLM:
 
         logger = getattr(self, "query_similarity_logger", None)
         if logger is not None:
-            logger.record_decode(layer_idx, query_states.detach())
+            logger.record_decode(layer_idx, query_states_no_rope, current_position)
 
         key_states, value_states = self.kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
         attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx, query_states_next)
