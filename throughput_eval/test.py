@@ -126,7 +126,7 @@ if __name__ == "__main__":
     attention_masks = inputs.attention_mask
 
     input_len = input_ids.shape[1]
-    gen_len = 256
+    gen_len = 4
     max_len = input_len + gen_len
     print(colored(f"Input length: {input_len}", 'yellow'))
 

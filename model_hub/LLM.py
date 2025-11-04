@@ -113,6 +113,10 @@ class LLM:
         if estimate_next_query:
             query_states_next = query_states_next.view(bsz, -1, self.num_heads, self.head_dim)
 
+        logger = getattr(self, "query_similarity_logger", None)
+        if logger is not None:
+            logger.record_decode(layer_idx, query_states.detach())
+
         key_states, value_states = self.kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
         attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx, query_states_next)
         hidden_states = self.wo(attn_out, layer, bsz, seq_len, dim)
@@ -225,6 +229,9 @@ class LLM:
         self.input_length = input_length
         self.max_new_length = max_new_length
         self.attention_type = attention_type
+        logger = getattr(self, "query_similarity_logger", None)
+        if logger is not None:
+            logger.set_batch_size(bs)
 
         valid_start = attention_masks.shape[1] - torch.sum(attention_masks, dim=-1).detach().cpu().numpy()
         del attention_masks
@@ -233,6 +240,10 @@ class LLM:
         print("Allocate GPU buffers and CPU pin memory ...\n")
         self.init_kv_cache(input_length, valid_start, attn_config)
 
-        outputs = self.inference(inputs_ids)
+        try:
+            outputs = self.inference(inputs_ids)
+        finally:
+            if logger is not None:
+                logger.close()
 
         return outputs

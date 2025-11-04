@@ -1,3 +1,4 @@
+import csv
 import gc
 import re
 import os
@@ -10,6 +11,93 @@ from .LLM import LLM
 from cache_hub import flash_attn_cache, retroinfer_cache
 from attn_hub import prefill_full_flash_attn, decode_full_flash_attn, retroinfer_prefill_attn, retroinfer_decode_attn
 
+
+class QuerySimilarityLogger:
+    """Stream query-head similarity statistics for decode steps to CSV."""
+
+    def __init__(self, output_path: str, max_pairs: int = -1) -> None:
+        self.output_path = output_path
+        self.max_pairs = max_pairs
+        self.file_handle = None
+        self.writer = None
+        self.batch_size = 1
+        self.prev_queries = {}
+        self.decode_token_counts = {}
+
+    def set_batch_size(self, batch_size: int) -> None:
+        self.batch_size = batch_size
+        self.prev_queries.clear()
+        self.decode_token_counts.clear()
+
+    def _ensure_open(self) -> None:
+        if self.file_handle is not None:
+            return
+
+        directory = os.path.dirname(self.output_path)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+
+        self.file_handle = open(self.output_path, "w", newline="")
+        self.writer = csv.writer(self.file_handle)
+        self.writer.writerow(["token_pair", "layer", "mean", "min", "max", "std"])
+
+    def _should_log_pair(self, prev_token_idx: int) -> bool:
+        return self.max_pairs is None or self.max_pairs < 0 or prev_token_idx < self.max_pairs
+
+    def record_decode(self, layer_idx: int, query_states: torch.Tensor, sample_offset: int = 0) -> None:
+        if query_states.numel() == 0:
+            return
+
+        self._ensure_open()
+        normalized = F.normalize(query_states.detach().to(torch.float32), dim=-1, eps=1e-6)
+        bsz, seq_len, _, _ = normalized.shape
+
+        for batch_idx in range(bsz):
+            sample_id = sample_offset + batch_idx
+            prefix = "" if self.batch_size == 1 else f"sample{sample_id}_"
+            key = (layer_idx, sample_id)
+            prev = self.prev_queries.get(key)
+            prev_idx = self.decode_token_counts.get(key, -1)
+
+            for pos in range(seq_len):
+                current = normalized[batch_idx, pos]
+
+                if prev is None:
+                    self.prev_queries[key] = current.clone()
+                    self.decode_token_counts[key] = 0
+                    prev = self.prev_queries[key]
+                    prev_idx = 0
+                    continue
+
+                current_idx = prev_idx + 1
+                if self._should_log_pair(prev_idx):
+                    sims = (prev * current).sum(dim=-1)
+                    mean = sims.mean().item()
+                    minv = sims.min().item()
+                    maxv = sims.max().item()
+                    stdv = sims.std(unbiased=False).item()
+                    token_pair = f"{prefix}token{prev_idx}&{current_idx}"
+                    self.writer.writerow([
+                        token_pair,
+                        layer_idx + 1,
+                        f"{mean:.4f}",
+                        f"{minv:.4f}",
+                        f"{maxv:.4f}",
+                        f"{stdv:.4f}",
+                    ])
+
+                self.prev_queries[key] = current.clone()
+                self.decode_token_counts[key] = current_idx
+                prev = self.prev_queries[key]
+                prev_idx = current_idx
+
+    def close(self) -> None:
+        if self.file_handle:
+            self.file_handle.close()
+            self.file_handle = None
+            self.writer = None
+        self.prev_queries.clear()
+        self.decode_token_counts.clear()
 
 
 class LlamaLayer:
@@ -74,6 +162,22 @@ class LlamaModel(LLM):
         self.vocab_size = self.config.vocab_size
         self.eos_tokens = [self.config.eos_token_id]
         self.use_cluster_estimation = use_cluster_estimation
+
+        log_query_env = os.environ.get("LOG_QUERY_SIMILARITY", "").lower()
+        self.log_query_similarity = log_query_env in {"1", "true", "yes"}
+        self.query_similarity_logger = None
+        if self.log_query_similarity:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            output_default = os.path.join(project_root, "logs", "query_similarity.csv")
+            output_path = os.environ.get("QUERY_SIMILARITY_OUTPUT", output_default)
+            max_pairs_env = os.environ.get("QUERY_SIMILARITY_MAX_PAIRS")
+            max_pairs = -1
+            if max_pairs_env is not None:
+                try:
+                    max_pairs = int(max_pairs_env)
+                except ValueError:
+                    max_pairs = -1
+            self.query_similarity_logger = QuerySimilarityLogger(output_path, max_pairs)
 
         self.init_model()
 
