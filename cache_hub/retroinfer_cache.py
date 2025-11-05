@@ -861,12 +861,12 @@ class retroinfer_cache(KV_Cache):
             self.wave_buffer[layer_idx + 1].sync()
             self.wave_buffer[layer_idx].batch_update()
 
-        start = time.perf_counter()
-        self.device_list_key.copy_(self.list_keys[layer_idx])
-        self.device_list_value.copy_(self.list_values[layer_idx])
-        torch.cuda.synchronize()
-        end = time.perf_counter()
-        kv_copy_time.append((end-start) * 1000)
+        # start = time.perf_counter()
+        # self.device_list_key.copy_(self.list_keys[layer_idx])
+        # self.device_list_value.copy_(self.list_values[layer_idx])
+        # torch.cuda.synchronize()
+        # end = time.perf_counter()
+        # kv_copy_time.append((end-start) * 1000)
 
         # assemble the execution buffer
         start = time.perf_counter()
@@ -876,17 +876,17 @@ class retroinfer_cache(KV_Cache):
             # print ("hit ", torch.sum (self.hit_unit_sizes[layer_idx], dim=1))
             # print ("miss ", torch.sum (self.miss_unit_sizes[layer_idx], dim=1))
             # print("Layer ", layer_idx, " gather copy and concat:")
-            # print(self.miss_unit_idices[layer_idx])
-            # print(self.miss_unit_sizes[layer_idx])
-            # print(self.miss_num_units[layer_idx])
+            print(self.miss_unit_idices[layer_idx])
+            print(self.miss_unit_sizes[layer_idx])
+            print(self.miss_num_units[layer_idx])
 
-            # print(self.hit_unit_idices[layer_idx])
-            # print(self.hit_unit_sizes[layer_idx])
-            # print(self.hit_num_units[layer_idx])
+            print(self.hit_unit_idices[layer_idx])
+            print(self.hit_unit_sizes[layer_idx])
+            print(self.hit_num_units[layer_idx])
 
             torch.cuda.nvtx.range_push("current_layer_copy")
-            gather_copy_and_concat(self.steady_zone_keys[layer_idx], self.device_list_key, self.cache_keys[layer_idx], self.execution_buffer_keys[buffer_idx],
-                                self.steady_zone_values[layer_idx], self.device_list_value, self.cache_values[layer_idx], self.execution_buffer_values[buffer_idx],
+            gather_copy_and_concat(self.steady_zone_keys[layer_idx], self.list_keys[layer_idx], self.cache_keys[layer_idx], self.execution_buffer_keys[buffer_idx],
+                                self.steady_zone_values[layer_idx], self.list_values[layer_idx], self.cache_values[layer_idx], self.execution_buffer_values[buffer_idx],
                                 self.miss_unit_idices[layer_idx], self.miss_unit_sizes[layer_idx], self.miss_unit_sizes_cumsum[layer_idx], self.miss_num_units[layer_idx],
                                 self.hit_unit_idices[layer_idx], self.hit_unit_sizes[layer_idx], self.hit_unit_sizes_cumsum[layer_idx], self.hit_num_units[layer_idx],
                                 self.valid_lengths[buffer_idx], self.batch_groups, 

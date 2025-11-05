@@ -279,6 +279,7 @@ __global__ void concat_gather_copy(
         int BLOCKS_2 = min((TOTAL_BLOCKS * src2_cpy_chunk_num + total_cpy_chunk_num - 1) / total_cpy_chunk_num, 
                            TOTAL_BLOCKS - 1);   // when cpy2 >> cpy3, but cp3 > 0, BLOCKS_2 = TOTAL_BLOCKS - 1
         if (src3_cpy_chunk_num == 0) BLOCKS_2 = TOTAL_BLOCKS;  // however, when cpy3 == 0, BLOCKS_2 = TOTAL_BLOCKS
+        // int BLOCKS_2 = 7;
         // number of CUDA blocks used to copy from src3
         int BLOCKS_3 = TOTAL_BLOCKS - BLOCKS_2;
 

@@ -1,589 +1,25 @@
-import time
 import torch
-import flashinfer
-from retroinfer_kernels import gather_copy_and_concat
-from weighted_flash_decoding import weighted_flash_decoding
 import matplotlib.pyplot as plt
 import numpy as np
 
-def profile_flashinfer(
-    num_pages: int,
-    selected_pages: int,
-    page_size_full: int,
-    page_size: int,
-    batch_size: int,
-    kv_head: int,
-    head_dim: int,
-    dtype: torch.dtype,
-    device: str,
-):
-    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device='cuda')
-    decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, "NHD"
-    )
+# Import profiling functions from profiling.py
+from profiling import (
+    profile_flashinfer,
+    profile_flashinfer_mixed,
+    profile_gather_attention,
+    profile_gather_attention_mixed,
+    profile_gather_attention_mixed_cache,
+    profile_mixed_cache,
+    profile_mixed2_cache
+)
 
-    num_pages *= batch_size
-
-    queries = torch.randn((batch_size * kv_head, 4, head_dim), dtype=dtype, device='cuda').contiguous()
-
-    if device == 'cuda':
-        keys = torch.randn((num_pages, page_size, 1, head_dim), dtype=dtype, device='cuda').contiguous()
-        values = torch.randn((num_pages, page_size, 1, head_dim), dtype=dtype, device='cuda').contiguous()
-    else:
-        keys = torch.randn((num_pages, page_size, 1, head_dim), dtype=dtype, pin_memory=True).contiguous()
-        values = torch.randn((num_pages, page_size, 1, head_dim), dtype=dtype, pin_memory=True).contiguous()
-
-    if page_size == 1:
-        # Generate consecutive indices with random chunk sizes from [1, 15] that sum to selected_pages
-        kv_indices_list = []
-        kv_indptr_list = [0]
-
-        for i in range(batch_size * kv_head):
-            remaining = selected_pages
-            current_indices = []
-
-            while remaining > 0:
-                # Random chunk size between 1 and min(15, remaining)
-                chunk_size = torch.randint(1, min(2 * page_size_full, remaining + 1), (1,)).item()
-                # Random starting position for this chunk
-                start_idx = torch.randint(0, num_pages - chunk_size + 1, (1,)).item()
-                # Add consecutive indices
-                current_indices.extend(range(start_idx, start_idx + chunk_size))
-                remaining -= chunk_size
-
-            kv_indices_list.extend(current_indices)
-            kv_indptr_list.append(len(kv_indices_list))
-
-        kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
-        kv_indices = torch.tensor(kv_indices_list, dtype=torch.int32)
-        kv_last_page_len = torch.full((batch_size * kv_head,), page_size, dtype=torch.int32)
-    else:
-        kv_indptr = torch.tensor(
-            [i * selected_pages for i in range(batch_size * kv_head + 1)], dtype=torch.int32
-        )
-        kv_indices = torch.randperm(num_pages, dtype=torch.int32)[: batch_size * kv_head * selected_pages]
-        kv_last_page_len = torch.full((batch_size * kv_head,), page_size, dtype=torch.int32)
-
-    # warmup
-    for it in range(5):
-        decode_wrapper.plan(
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            4,
-            1,
-            head_dim,
-            page_size,
-            pos_encoding_mode="NONE",
-            q_data_type=dtype,
-            kv_data_type=dtype,
-        )
-
-        attn_out, lse_out = decode_wrapper.run(
-            queries,
-            (keys, values),
-            return_lse=True
-        )
-    
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-
-    start = time.perf_counter()
-    # profile
-    for it in range(10):
-        decode_wrapper.plan(
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            4,
-            1,
-            head_dim,
-            page_size,
-            pos_encoding_mode="NONE",
-            q_data_type=dtype,
-            kv_data_type=dtype,
-        )
-
-        attn_out, lse_out = decode_wrapper.run(
-            queries,
-            (keys, values),
-            return_lse=True
-        )
-        torch.cuda.synchronize()
-    end = time.perf_counter()
-    total_time = end - start
-    
-    return total_time / 10 * 1000
-
-def profile_flashinfer_mixed(
-    num_pages: int,
-    selected_pages_full: int,
-    page_size_full: int,
-    selected_pages_scatter: int,
-    page_size_scatter: int,
-    batch_size: int,
-    kv_head: int,
-    head_dim: int,
-    dtype: torch.dtype,
-    device: str,
-):
-    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device='cuda')
-    decode_wrapper_full = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, "NHD"
-    )
-    decode_wrapper_scatter = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, "NHD"
-    )
-
-    num_pages *= batch_size
-
-    queries = torch.randn((batch_size * kv_head, 4, head_dim), dtype=dtype, device='cuda').contiguous()
-
-    if device == 'cuda':
-        keys_full = torch.randn((num_pages, page_size_full, 1, head_dim), dtype=dtype, device='cuda').contiguous()
-        values_full = torch.randn((num_pages, page_size_full, 1, head_dim), dtype=dtype, device='cuda').contiguous()
-        keys_scatter = torch.randn((num_pages, page_size_scatter, 1, head_dim), dtype=dtype, device='cuda').contiguous()
-        values_scatter = torch.randn((num_pages, page_size_scatter, 1, head_dim), dtype=dtype, device='cuda').contiguous()
-    else:
-        keys_full = torch.randn((num_pages, page_size_full, 1, head_dim), dtype=dtype, pin_memory=True).contiguous()
-        values_full = torch.randn((num_pages, page_size_full, 1, head_dim), dtype=dtype, pin_memory=True).contiguous()
-        keys_scatter = torch.randn((num_pages, page_size_scatter, 1, head_dim), dtype=dtype, pin_memory=True).contiguous()
-        values_scatter = torch.randn((num_pages, page_size_scatter, 1, head_dim), dtype=dtype, pin_memory=True).contiguous()
-
-    # full pages
-    kv_indptr_full = torch.tensor(
-        [i * selected_pages_full for i in range(batch_size * kv_head + 1)], dtype=torch.int32
-    )
-    kv_indices_full = torch.randperm(num_pages, dtype=torch.int32)[: batch_size * kv_head * selected_pages_full]
-    kv_last_page_len_full = torch.full((batch_size * kv_head,), page_size_full, dtype=torch.int32)
-
-    # scatter pages
-    kv_indices_list = []
-    kv_indptr_list = [0]
-
-    for i in range(batch_size * kv_head):
-        remaining = selected_pages_scatter
-        current_indices = []
-
-        while remaining > 0:
-            # Random chunk size between 1 and min(2 * page_size_full - 1, remaining)
-            chunk_size = torch.randint(1, min(2 * page_size_full, remaining + 1), (1,)).item()
-            # Random starting position for this chunk
-            start_idx = torch.randint(0, num_pages - chunk_size + 1, (1,)).item()
-            # Add consecutive indices
-            current_indices.extend(range(start_idx, start_idx + chunk_size))
-            remaining -= chunk_size
-
-        kv_indices_list.extend(current_indices)
-        kv_indptr_list.append(len(kv_indices_list))
-
-    kv_indptr_scatter = torch.tensor(kv_indptr_list, dtype=torch.int32)
-    kv_indices_scatter = torch.tensor(kv_indices_list, dtype=torch.int32)
-    kv_last_page_len_scatter = torch.full((batch_size * kv_head,), page_size_scatter, dtype=torch.int32)
-
-    # warmup
-    for it in range(5):
-        decode_wrapper_full.plan(
-            kv_indptr_full,
-            kv_indices_full,
-            kv_last_page_len_full,
-            4,
-            1,
-            head_dim,
-            page_size_full,
-            pos_encoding_mode="NONE",
-            q_data_type=dtype,
-            kv_data_type=dtype,
-        )
-        decode_wrapper_scatter.plan(
-            kv_indptr_scatter,
-            kv_indices_scatter,
-            kv_last_page_len_scatter,
-            4,
-            1,
-            head_dim,
-            page_size_scatter,
-            pos_encoding_mode="NONE",
-            q_data_type=dtype,
-            kv_data_type=dtype,
-        )
-
-        attn_out, lse_out = decode_wrapper_full.run(
-            queries,
-            (keys_full, values_full),
-            return_lse=True
-        )
-
-        attn_out, lse_out = decode_wrapper_scatter.run(
-            queries,
-            (keys_scatter, values_scatter),
-            return_lse=True
-        )
-
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-
-    start = time.perf_counter()
-    # profile
-    for it in range(10):
-        decode_wrapper_full.plan(
-            kv_indptr_full,
-            kv_indices_full,
-            kv_last_page_len_full,
-            4,
-            1,
-            head_dim,
-            page_size_full,
-            pos_encoding_mode="NONE",
-            q_data_type=dtype,
-            kv_data_type=dtype,
-        )
-        decode_wrapper_scatter.plan(
-            kv_indptr_scatter,
-            kv_indices_scatter,
-            kv_last_page_len_scatter,
-            4,
-            1,
-            head_dim,
-            page_size_scatter,
-            pos_encoding_mode="NONE",
-            q_data_type=dtype,
-            kv_data_type=dtype,
-        )
-
-        attn_out, lse_out = decode_wrapper_full.run(
-            queries,
-            (keys_full, values_full),
-            return_lse=True
-        )
-
-        attn_out, lse_out = decode_wrapper_scatter.run(
-            queries,
-            (keys_scatter, values_scatter),
-            return_lse=True
-        )
-        torch.cuda.synchronize()
-    
-    end = time.perf_counter()
-    total_time = end - start
-
-    return total_time / 10 * 1000
-
-def profile_gather_attention(
-    n_centroids: int,
-    nprobe: int,
-    page_size: int,
-    cache_cluster_num: int,
-    batch_size: int,
-    kv_head: int,
-    head_dim: int,
-    dtype: torch.dtype,
-    device: str,
-):
-    input_length = 120000
-    static_pattern_total = 4 + 64
-    max_new_length = 1024
-    THRESHOLD_LENGTH = 1024
-    input_length_new = ((max_new_length-2) // THRESHOLD_LENGTH) * THRESHOLD_LENGTH
-    pages_per_cluster = 2
-    buffer_size = max(int(nprobe * 4), 16) * pages_per_cluster
-    static_stride = static_pattern_total + max_new_length
-    cache_size = cache_cluster_num * pages_per_cluster
-    batch_groups = batch_size * kv_head
-    list_stride = input_length - static_pattern_total + input_length_new
-    cache_stride = cache_size
-    static_len = static_pattern_total
-
-    steady_zone_keys = torch.randn((batch_size, kv_head, static_pattern_total+max_new_length, head_dim), 
-        dtype=dtype, device="cuda")
-    steady_zone_values = torch.randn((batch_size, kv_head, static_pattern_total+max_new_length, head_dim), 
-        dtype=dtype, device="cuda")
-
-    if device == 'cuda':
-        list_keys = torch.randn((batch_size, kv_head, input_length-static_pattern_total+input_length_new, head_dim), 
-                            dtype=dtype, device="cuda").contiguous()
-        list_values = torch.randn((batch_size, kv_head, input_length-static_pattern_total+input_length_new, head_dim), 
-                            dtype=dtype, device="cuda").contiguous()
-    else:
-        list_keys = torch.randn((batch_size, kv_head, input_length-static_pattern_total+input_length_new, head_dim), 
-                                dtype=dtype, pin_memory=True).contiguous()
-        list_values = torch.randn((batch_size, kv_head, input_length-static_pattern_total+input_length_new, head_dim), 
-                                dtype=dtype, pin_memory=True).contiguous()
-
-    cache_keys = torch.zeros((batch_size, kv_head, cache_size, page_size, head_dim),
-                                dtype=dtype, device="cuda").contiguous()
-    cache_values = torch.zeros((batch_size, kv_head, cache_size, page_size, head_dim),
-                                dtype=dtype, device="cuda").contiguous()
-
-    hit_unit_idices = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    hit_unit_sizes = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    hit_unit_sizes_cumsum = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    hit_num_units = torch.zeros((batch_size*kv_head), dtype=torch.int32, pin_memory=True).contiguous()
-    
-    # pin memory indices for missing clusters
-    miss_unit_idices = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    miss_unit_sizes = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    miss_unit_sizes_cumsum = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    miss_num_units = torch.zeros((batch_size*kv_head), dtype=torch.int32, pin_memory=True).contiguous()
-                                    
-    execution_buffer_keys = torch.zeros((batch_size*kv_head, buffer_size*page_size+static_stride, 1, head_dim), 
-                                                dtype=dtype, device="cuda").contiguous()
-    execution_buffer_values = torch.zeros((batch_size*kv_head, buffer_size*page_size+static_stride, 1, head_dim), 
-                                                dtype=dtype, device="cuda").contiguous()
-    valid_lengths = torch.zeros((batch_size*kv_head), dtype=torch.int32, device="cuda").contiguous()
-    execution_stride = buffer_size * page_size + static_stride
-
-    queries = torch.randn((batch_size * kv_head, 4, head_dim), dtype=dtype, device='cuda').contiguous()
-
-    # init missing units
-    miss_unit_idices[:, :nprobe] = torch.randint(0, input_length - static_pattern_total + input_length_new,
-                                                    (batch_groups, nprobe), dtype=torch.int32)
-    if page_size == 1:
-        # Generate random sizes from [1, 15] that sum to nprobe for each batch group
-        for bg in range(batch_groups):
-            remaining = nprobe
-            num_units = 0
-            while remaining > 0:
-                # Random size between 1 and min(15, remaining)
-                size = torch.randint(1, min(16, remaining + 1), (1,)).item()
-                miss_unit_sizes[bg, num_units] = size
-                remaining -= size
-                num_units += 1
-            miss_num_units[bg] = num_units
-    else:
-        miss_unit_sizes[:, :nprobe].fill_(page_size)
-    
-    miss_unit_sizes_cumsum[:, :nprobe] = torch.cumsum(miss_unit_sizes[:, :nprobe], dim=1, dtype=torch.int32)
-    miss_num_units.fill_(nprobe)
-
-    valid_lengths[:] = miss_unit_sizes_cumsum[:, nprobe - 1]
-
-    # print(miss_unit_idices)
-    # print(miss_unit_sizes)
-    # print(miss_num_units)
-    # print(hit_unit_idices)
-    # print(hit_unit_sizes)
-    # print(hit_num_units)
-    # print(valid_lengths)
-
-    # warmup
-    for it in range(5):
-        gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
-                            steady_zone_values, list_values, cache_values, execution_buffer_values,
-                            miss_unit_idices, miss_unit_sizes, miss_unit_sizes_cumsum, miss_num_units,
-                            hit_unit_idices, hit_unit_sizes, hit_unit_sizes_cumsum, hit_num_units,
-                            valid_lengths, batch_groups, 
-                            static_stride, list_stride, cache_stride,
-                            execution_stride, buffer_size, static_len)
-        
-        attn_out, lse_out = weighted_flash_decoding(
-            queries.view(batch_groups, 1, 4, head_dim), 
-            execution_buffer_keys,    # (batch_size*group_num, execution_stride, 1, dim)
-            execution_buffer_values,  # (batch_size*group_num, execution_stride, 1, dim)
-            previous_out=None,
-            previous_lse=None,
-            cache_seqlens=valid_lengths,
-            return_softmax_lse=True
-        )
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-
-    # profile - measure gather and attention separately
-    gather_time_total = 0
-    attn_time_total = 0
-
-    for it in range(10):
-        # Measure gather time
-        start_gather = time.perf_counter()
-        gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
-                            steady_zone_values, list_values, cache_values, execution_buffer_values,
-                            miss_unit_idices, miss_unit_sizes, miss_unit_sizes_cumsum, miss_num_units,
-                            hit_unit_idices, hit_unit_sizes, hit_unit_sizes_cumsum, hit_num_units,
-                            valid_lengths, batch_groups,
-                            static_stride, list_stride, cache_stride,
-                            execution_stride, buffer_size, static_len)
-        torch.cuda.synchronize()
-        end_gather = time.perf_counter()
-        gather_time_total += (end_gather - start_gather)
-
-        # Measure attention time
-        start_attn = time.perf_counter()
-        attn_out, lse_out = weighted_flash_decoding(
-            queries.view(batch_groups, 1, 4, head_dim),
-            execution_buffer_keys,    # (batch_size*group_num, execution_stride, 1, dim)
-            execution_buffer_values,  # (batch_size*group_num, execution_stride, 1, dim)
-            previous_out=None,
-            previous_lse=None,
-            cache_seqlens=valid_lengths,
-            return_softmax_lse=True
-        )
-        torch.cuda.synchronize()
-        end_attn = time.perf_counter()
-        attn_time_total += (end_attn - start_attn)
-
-    total_time = (gather_time_total + attn_time_total) / 10 * 1000
-    gather_time = gather_time_total / 10 * 1000
-    attn_time = attn_time_total / 10 * 1000
-
-    return total_time, gather_time, attn_time
-
-def profile_gather_attention_mixed(
-    n_centroids: int,
-    nprobe: int,
-    page_size_full: int,
-    page_size_scatter: int,
-    cache_cluster_num: int,
-    batch_size: int,
-    kv_head: int,
-    head_dim: int,
-    dtype: torch.dtype,
-    device: str,
-):
-    input_length = 120000
-    static_pattern_total = 4 + 64
-    max_new_length = 1024
-    THRESHOLD_LENGTH = 1024
-    input_length_new = ((max_new_length-2) // THRESHOLD_LENGTH) * THRESHOLD_LENGTH
-    pages_per_cluster = 2
-    buffer_size = max(int(nprobe * 4), 16) * pages_per_cluster
-    static_stride = static_pattern_total + max_new_length
-    cache_size = cache_cluster_num * pages_per_cluster
-    batch_groups = batch_size * kv_head
-    list_stride = input_length - static_pattern_total + input_length_new
-    cache_stride = cache_size
-    static_len = static_pattern_total
-
-    steady_zone_keys = torch.randn((batch_size, kv_head, static_pattern_total+max_new_length, head_dim), 
-        dtype=dtype, device="cuda")
-    steady_zone_values = torch.randn((batch_size, kv_head, static_pattern_total+max_new_length, head_dim), 
-        dtype=dtype, device="cuda")
-
-    if device == 'cuda':
-        list_keys = torch.randn((batch_size, kv_head, input_length-static_pattern_total+input_length_new, head_dim), 
-                            dtype=dtype, device="cuda").contiguous()
-        list_values = torch.randn((batch_size, kv_head, input_length-static_pattern_total+input_length_new, head_dim), 
-                            dtype=dtype, device="cuda").contiguous()
-    else:
-        list_keys = torch.randn((batch_size, kv_head, input_length-static_pattern_total+input_length_new, head_dim), 
-                                dtype=dtype, pin_memory=True).contiguous()
-        list_values = torch.randn((batch_size, kv_head, input_length-static_pattern_total+input_length_new, head_dim), 
-                                dtype=dtype, pin_memory=True).contiguous()
-
-    cache_keys = torch.zeros((batch_size, kv_head, cache_size, page_size_full, head_dim),
-                                dtype=dtype, device="cuda").contiguous()
-    cache_values = torch.zeros((batch_size, kv_head, cache_size, page_size_full, head_dim),
-                                dtype=dtype, device="cuda").contiguous()
-
-    hit_unit_idices = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    hit_unit_sizes = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    hit_unit_sizes_cumsum = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    hit_num_units = torch.zeros((batch_size*kv_head), dtype=torch.int32, pin_memory=True).contiguous()
-    
-    # pin memory indices for missing clusters
-    miss_unit_idices = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    miss_unit_sizes = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    miss_unit_sizes_cumsum = torch.zeros((batch_size*kv_head, buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-    miss_num_units = torch.zeros((batch_size*kv_head), dtype=torch.int32, pin_memory=True).contiguous()
-                                    
-    execution_buffer_keys = torch.zeros((batch_size*kv_head, buffer_size*page_size_full+static_stride, 1, head_dim), 
-                                                dtype=dtype, device="cuda").contiguous()
-    execution_buffer_values = torch.zeros((batch_size*kv_head, buffer_size*page_size_full+static_stride, 1, head_dim), 
-                                                dtype=dtype, device="cuda").contiguous()
-    valid_lengths = torch.zeros((batch_size*kv_head), dtype=torch.int32, device="cuda").contiguous()
-    execution_stride = buffer_size * page_size_full + static_stride
-
-    queries = torch.randn((batch_size * kv_head, 4, head_dim), dtype=dtype, device='cuda').contiguous()
-
-    # init missing units
-    miss_unit_idices[:, :nprobe] = torch.randint(0, input_length - static_pattern_total + input_length_new,
-                                                    (batch_groups, nprobe), dtype=torch.int32)
-    # Generate sizes from normal distribution with mean=page_size_full, std=page_size_full/4
-    # Clamp to be at least 1
-    miss_unit_sizes[:, :nprobe] = torch.clamp(
-        torch.normal(mean=float(2 * page_size_full), std=float(2 * page_size_full) / 4.0,
-                     size=(batch_groups, nprobe)).to(torch.int32),
-        min=1
-    )
-    miss_unit_sizes_cumsum[:, :nprobe] = torch.cumsum(miss_unit_sizes[:, :nprobe], dim=1, dtype=torch.int32)
-    miss_num_units.fill_(nprobe)
-
-    valid_lengths[:] = miss_unit_sizes_cumsum[:, nprobe - 1]
-
-    # print(miss_unit_idices)
-    # print(miss_unit_sizes)
-    # print(miss_num_units)
-    # print(hit_unit_idices)
-    # print(hit_unit_sizes)
-    # print(hit_num_units)
-    # print(valid_lengths)
-
-    # warmup
-    for it in range(5):
-        gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
-                            steady_zone_values, list_values, cache_values, execution_buffer_values,
-                            miss_unit_idices, miss_unit_sizes, miss_unit_sizes_cumsum, miss_num_units,
-                            hit_unit_idices, hit_unit_sizes, hit_unit_sizes_cumsum, hit_num_units,
-                            valid_lengths, batch_groups, 
-                            static_stride, list_stride, cache_stride,
-                            execution_stride, buffer_size, static_len)
-        
-        attn_out, lse_out = weighted_flash_decoding(
-            queries.view(batch_groups, 1, 4, head_dim), 
-            execution_buffer_keys,    # (batch_size*group_num, execution_stride, 1, dim)
-            execution_buffer_values,  # (batch_size*group_num, execution_stride, 1, dim)
-            previous_out=None,
-            previous_lse=None,
-            cache_seqlens=valid_lengths,
-            return_softmax_lse=True
-        )
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-
-    # profile - measure gather and attention separately
-    gather_time_total = 0
-    attn_time_total = 0
-
-    # profile
-    start = time.perf_counter()
-    for it in range(10):
-        start_gather = time.perf_counter()
-        gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
-                            steady_zone_values, list_values, cache_values, execution_buffer_values,
-                            miss_unit_idices, miss_unit_sizes, miss_unit_sizes_cumsum, miss_num_units,
-                            hit_unit_idices, hit_unit_sizes, hit_unit_sizes_cumsum, hit_num_units,
-                            valid_lengths, batch_groups, 
-                            static_stride, list_stride, cache_stride,
-                            execution_stride, buffer_size, static_len)
-        torch.cuda.synchronize()
-        end_gather = time.perf_counter()
-        gather_time_total += (end_gather - start_gather)
-
-        # Measure attention time
-        start_attn = time.perf_counter()
-        attn_out, lse_out = weighted_flash_decoding(
-            queries.view(batch_groups, 1, 4, head_dim), 
-            execution_buffer_keys,    # (batch_size*group_num, execution_stride, 1, dim)
-            execution_buffer_values,  # (batch_size*group_num, execution_stride, 1, dim)
-            previous_out=None,
-            previous_lse=None,
-            cache_seqlens=valid_lengths,
-            return_softmax_lse=True
-        )
-        torch.cuda.synchronize()
-        end_attn = time.perf_counter()
-        attn_time_total += (end_attn - start_attn)
-    
-    total_time = (gather_time_total + attn_time_total) / 10 * 1000
-    gather_time = gather_time_total / 10 * 1000
-    attn_time = attn_time_total / 10 * 1000
-
-    return total_time, gather_time, attn_time
 
 def main():
     # FlashInfer Configuration 1: Full pages
     flashinfer_config1 = {
         'num_pages': 15300,
         'selected_pages': 175,
+        'page_size_full': 8,
         'page_size': 8,
         'kv_head': 8,
         'head_dim': 128,
@@ -594,6 +30,7 @@ def main():
     flashinfer_config2 = {
         'num_pages': 130000,
         'selected_pages': 510,
+        'page_size_full': 8,
         'page_size': 1,
         'kv_head': 8,
         'head_dim': 128,
@@ -646,6 +83,38 @@ def main():
         'dtype': torch.bfloat16,
     }
 
+    # FlashInfer Configuration 4: mixed pages with cache
+    flashinfer_config4 = {
+        'n_centroids': 7680,
+        'nprobe': 138,
+        'cache_cluster_num': 414,
+        'cache_hit_rate': 0.9,
+        'num_pages': 15300,
+        'selected_pages_full': 175,
+        'page_size_full': 8,
+        'selected_pages_scatter': 510,
+        'page_size_scatter': 1,
+        'kv_head': 8,
+        'head_dim': 128,
+        'dtype': torch.bfloat16,
+    }
+
+    # Gather Attention Configuration 4: mixed pages with cache
+    gather_config4 = {
+        'n_centroids': 7680,
+        'nprobe': 138,
+        'cache_cluster_num': 414,
+        'cache_hit_rate': 0.9,
+        'num_pages': 15300,
+        'selected_pages_full': 175,
+        'page_size_full': 8,
+        'selected_pages_scatter': 510,
+        'page_size_scatter': 1,
+        'kv_head': 8,
+        'head_dim': 128,
+        'dtype': torch.bfloat16,
+    }
+
     # Batch sizes to test
     batch_sizes = [1, 2, 4, 8, 16, 32]
 
@@ -654,15 +123,19 @@ def main():
         'flashinfer_cpu_config1': [],
         'flashinfer_cpu_config2': [],
         'flashinfer_cpu_config3': [],
+        'flashinfer_cpu_config4': [],
         'flashinfer_cuda_config1': [],
         'flashinfer_cuda_config2': [],
         'flashinfer_cuda_config3': [],
+        'flashinfer_cuda_config4': [],
         'gather_cpu_config1': [],
         'gather_cpu_config2': [],
         'gather_cpu_config3': [],
+        'gather_cpu_config4': [],
         'gather_cuda_config1': [],
         'gather_cuda_config2': [],
         'gather_cuda_config3': [],
+        'gather_cuda_config4': [],
         # Breakdown for gather attention
         'gather_cpu_config1_gather': [],
         'gather_cpu_config1_attn': [],
@@ -670,12 +143,25 @@ def main():
         'gather_cpu_config2_attn': [],
         'gather_cpu_config3_gather': [],
         'gather_cpu_config3_attn': [],
+        'gather_cpu_config4_gather': [],
+        'gather_cpu_config4_attn': [],
         'gather_cuda_config1_gather': [],
         'gather_cuda_config1_attn': [],
         'gather_cuda_config2_gather': [],
         'gather_cuda_config2_attn': [],
         'gather_cuda_config3_gather': [],
         'gather_cuda_config3_attn': [],
+        'gather_cuda_config4_gather': [],
+        'gather_cuda_config4_attn': [],
+        # Breakdown for config4 mixed cache (includes both gather and flashinfer)
+        'config4_cpu_gather': [],
+        'config4_cpu_attn': [],
+        'config4_cpu_flashinfer': [],
+        # Breakdown for config4 mixed2 cache (includes both gather and flashinfer)
+        'mixed2_cpu_config4': [],
+        'config4_cpu_mixed2_gather': [],
+        'config4_cpu_mixed2_attn': [],
+        'config4_cpu_mixed2_flashinfer': [],
     }
 
     print("Profiling FlashInfer and Gather Attention with different configurations...")
@@ -685,245 +171,275 @@ def main():
         print(f"\nBatch size: {batch_size}")
         print("-" * 80)
 
-        # FlashInfer CPU Config 1
+        # # FlashInfer CPU Config 1
+        # try:
+        #     print(f"  FlashInfer CPU - Config 1 (page_size={flashinfer_config1['page_size']})... ", end='', flush=True)
+        #     time_val = profile_flashinfer(batch_size=batch_size, device='cpu', **flashinfer_config1)
+        #     results['flashinfer_cpu_config1'].append(time_val)
+        #     print(f"{time_val:.2f} ms")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['flashinfer_cpu_config1'].append(None)
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # # FlashInfer CPU Config 2
+        # try:
+        #     print(f"  FlashInfer CPU - Config 2 (page_size={flashinfer_config2['page_size']})... ", end='', flush=True)
+        #     time_val = profile_flashinfer(batch_size=batch_size, device='cpu', **flashinfer_config2)
+        #     results['flashinfer_cpu_config2'].append(time_val)
+        #     print(f"{time_val:.2f} ms")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['flashinfer_cpu_config2'].append(None)
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # # FlashInfer CUDA Config 1
+        # try:
+        #     print(f"  FlashInfer CUDA - Config 1 (page_size={flashinfer_config1['page_size']})... ", end='', flush=True)
+        #     time_val = profile_flashinfer(batch_size=batch_size, device='cuda', **flashinfer_config1)
+        #     results['flashinfer_cuda_config1'].append(time_val)
+        #     print(f"{time_val:.2f} ms")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['flashinfer_cuda_config1'].append(None)
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # # FlashInfer CUDA Config 2
+        # try:
+        #     print(f"  FlashInfer CUDA - Config 2 (page_size={flashinfer_config2['page_size']})... ", end='', flush=True)
+        #     time_val = profile_flashinfer(batch_size=batch_size, device='cuda', **flashinfer_config2)
+        #     results['flashinfer_cuda_config2'].append(time_val)
+        #     print(f"{time_val:.2f} ms")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['flashinfer_cuda_config2'].append(None)
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # # Gather Attention CPU Config 1
+        # try:
+        #     print(f"  Gather Attn CPU - Config 1 (page_size={gather_config1['page_size']})... ", end='', flush=True)
+        #     total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cpu', **gather_config1)
+        #     results['gather_cpu_config1'].append(total_time)
+        #     results['gather_cpu_config1_gather'].append(gather_time)
+        #     results['gather_cpu_config1_attn'].append(attn_time)
+        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['gather_cpu_config1'].append(None)
+        #     results['gather_cpu_config1_gather'].append(None)
+        #     results['gather_cpu_config1_attn'].append(None)
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # # Gather Attention CPU Config 2
+        # try:
+        #     print(f"  Gather Attn CPU - Config 2 (page_size={gather_config2['page_size']})... ", end='', flush=True)
+        #     total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cpu', **gather_config2)
+        #     results['gather_cpu_config2'].append(total_time)
+        #     results['gather_cpu_config2_gather'].append(gather_time)
+        #     results['gather_cpu_config2_attn'].append(attn_time)
+        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['gather_cpu_config2'].append(None)
+        #     results['gather_cpu_config2_gather'].append(None)
+        #     results['gather_cpu_config2_attn'].append(None)
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # # Gather Attention CUDA Config 1
+        # try:
+        #     print(f"  Gather Attn CUDA - Config 1 (page_size={gather_config1['page_size']})... ", end='', flush=True)
+        #     total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cuda', **gather_config1)
+        #     results['gather_cuda_config1'].append(total_time)
+        #     results['gather_cuda_config1_gather'].append(gather_time)
+        #     results['gather_cuda_config1_attn'].append(attn_time)
+        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['gather_cuda_config1'].append(None)
+        #     results['gather_cuda_config1_gather'].append(None)
+        #     results['gather_cuda_config1_attn'].append(None)
+
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # # Gather Attention CUDA Config 2
+        # try:
+        #     print(f"  Gather Attn CUDA - Config 2 (page_size={gather_config2['page_size']})... ", end='', flush=True)
+        #     total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cuda', **gather_config2)
+        #     results['gather_cuda_config2'].append(total_time)
+        #     results['gather_cuda_config2_gather'].append(gather_time)
+        #     results['gather_cuda_config2_attn'].append(attn_time)
+        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['gather_cuda_config2'].append(None)
+        #     results['gather_cuda_config2_gather'].append(None)
+        #     results['gather_cuda_config2_attn'].append(None)
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # # FlashInfer CPU Config 3
+        # try:
+        #     print(f"  FlashInfer CPU - Config 3 (mixed)... ", end='', flush=True)
+        #     time_val = profile_flashinfer_mixed(batch_size=batch_size, device='cpu', **flashinfer_config3)
+        #     results['flashinfer_cpu_config3'].append(time_val)
+        #     print(f"{time_val:.2f} ms")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['flashinfer_cpu_config3'].append(None)
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # # FlashInfer CUDA Config 3
+        # try:
+        #     print(f"  FlashInfer CUDA - Config 3 (mixed)... ", end='', flush=True)
+        #     time_val = profile_flashinfer_mixed(batch_size=batch_size, device='cuda', **flashinfer_config3)
+        #     results['flashinfer_cuda_config3'].append(time_val)
+        #     print(f"{time_val:.2f} ms")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['flashinfer_cuda_config3'].append(None)
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # # Gather Attention CPU Config 3
+        # try:
+        #     print(f"  Gather Attn CPU - Config 3 (mixed)... ", end='', flush=True)
+        #     total_time, gather_time, attn_time = profile_gather_attention_mixed(batch_size=batch_size, device='cpu', **gather_config3)
+        #     results['gather_cpu_config3'].append(total_time)
+        #     results['gather_cpu_config3_gather'].append(gather_time)
+        #     results['gather_cpu_config3_attn'].append(attn_time)
+        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['gather_cpu_config3'].append(None)
+        #     results['gather_cpu_config3_gather'].append(None)
+        #     results['gather_cpu_config3_attn'].append(None)
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # # Gather Attention CUDA Config 3
+        # try:
+        #     print(f"  Gather Attn CUDA - Config 3 (mixed)... ", end='', flush=True)
+        #     total_time, gather_time, attn_time = profile_gather_attention_mixed(batch_size=batch_size, device='cuda', **gather_config3)
+        #     results['gather_cuda_config3'].append(total_time)
+        #     results['gather_cuda_config3_gather'].append(gather_time)
+        #     results['gather_cuda_config3_attn'].append(attn_time)
+        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        # except Exception as e:
+        #     print(f"FAILED: {e}")
+        #     results['gather_cuda_config3'].append(None)
+        #     results['gather_cuda_config3_gather'].append(None)
+        #     results['gather_cuda_config3_attn'].append(None)
+        # torch.cuda.synchronize()
+        # torch.cuda.empty_cache()
+
+        # FlashInfer CPU Config 4 (cache - CPU only)
         try:
-            print(f"  FlashInfer CPU - Config 1 (page_size={flashinfer_config1['page_size']})... ", end='', flush=True)
-            time_val = profile_flashinfer(batch_size=batch_size, device='cpu', **flashinfer_config1)
-            results['flashinfer_cpu_config1'].append(time_val)
-            print(f"{time_val:.2f} ms")
+            print(f"  FlashInfer CPU - Config 4 (mixed+cache)... ", end='', flush=True)
+            total_time, gather_attn_time, flashinfer_time = profile_mixed_cache(batch_size=batch_size, device='cpu', **flashinfer_config4)
+            results['flashinfer_cpu_config4'].append(total_time)
+            results['config4_cpu_gather'].append(gather_attn_time)
+            results['config4_cpu_attn'].append(None)  # Combined in gather_attn_time
+            results['config4_cpu_flashinfer'].append(flashinfer_time)
+            print(f"{total_time:.2f} ms (gather+attn: {gather_attn_time:.2f}, flashinfer: {flashinfer_time:.2f})")
         except Exception as e:
             print(f"FAILED: {e}")
-            results['flashinfer_cpu_config1'].append(None)
+            results['flashinfer_cpu_config4'].append(None)
+            results['config4_cpu_gather'].append(None)
+            results['config4_cpu_attn'].append(None)
+            results['config4_cpu_flashinfer'].append(None)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-        # FlashInfer CPU Config 2
+        # Mixed2 CPU Config 4 (cache - CPU only)
         try:
-            print(f"  FlashInfer CPU - Config 2 (page_size={flashinfer_config2['page_size']})... ", end='', flush=True)
-            time_val = profile_flashinfer(batch_size=batch_size, device='cpu', **flashinfer_config2)
-            results['flashinfer_cpu_config2'].append(time_val)
-            print(f"{time_val:.2f} ms")
+            print(f"  Mixed2 CPU - Config 4 (mixed+cache)... ", end='', flush=True)
+            total_time, gather_attn_time, flashinfer_time = profile_mixed2_cache(batch_size=batch_size, device='cpu', **flashinfer_config4)
+            results['mixed2_cpu_config4'].append(total_time)
+            results['config4_cpu_mixed2_gather'].append(gather_attn_time)
+            results['config4_cpu_mixed2_attn'].append(None)  # Combined in gather_attn_time
+            results['config4_cpu_mixed2_flashinfer'].append(flashinfer_time)
+            print(f"{total_time:.2f} ms (gather+attn: {gather_attn_time:.2f}, flashinfer: {flashinfer_time:.2f})")
         except Exception as e:
             print(f"FAILED: {e}")
-            results['flashinfer_cpu_config2'].append(None)
+            results['mixed2_cpu_config4'].append(None)
+            results['config4_cpu_mixed2_gather'].append(None)
+            results['config4_cpu_mixed2_attn'].append(None)
+            results['config4_cpu_mixed2_flashinfer'].append(None)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-        # FlashInfer CUDA Config 1
+        # Gather Attention CPU Config 4 (cache - CPU only)
         try:
-            print(f"  FlashInfer CUDA - Config 1 (page_size={flashinfer_config1['page_size']})... ", end='', flush=True)
-            time_val = profile_flashinfer(batch_size=batch_size, device='cuda', **flashinfer_config1)
-            results['flashinfer_cuda_config1'].append(time_val)
-            print(f"{time_val:.2f} ms")
-        except Exception as e:
-            print(f"FAILED: {e}")
-            results['flashinfer_cuda_config1'].append(None)
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-        # FlashInfer CUDA Config 2
-        try:
-            print(f"  FlashInfer CUDA - Config 2 (page_size={flashinfer_config2['page_size']})... ", end='', flush=True)
-            time_val = profile_flashinfer(batch_size=batch_size, device='cuda', **flashinfer_config2)
-            results['flashinfer_cuda_config2'].append(time_val)
-            print(f"{time_val:.2f} ms")
-        except Exception as e:
-            print(f"FAILED: {e}")
-            results['flashinfer_cuda_config2'].append(None)
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-        # Gather Attention CPU Config 1
-        try:
-            print(f"  Gather Attn CPU - Config 1 (page_size={gather_config1['page_size']})... ", end='', flush=True)
-            total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cpu', **gather_config1)
-            results['gather_cpu_config1'].append(total_time)
-            results['gather_cpu_config1_gather'].append(gather_time)
-            results['gather_cpu_config1_attn'].append(attn_time)
+            print(f"  Gather Attn CPU - Config 4 (mixed+cache)... ", end='', flush=True)
+            total_time, gather_time, attn_time = profile_gather_attention_mixed_cache(batch_size=batch_size, device='cpu', **gather_config4)
+            results['gather_cpu_config4'].append(total_time)
+            results['gather_cpu_config4_gather'].append(gather_time)
+            results['gather_cpu_config4_attn'].append(attn_time)
             print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
         except Exception as e:
             print(f"FAILED: {e}")
-            results['gather_cpu_config1'].append(None)
-            results['gather_cpu_config1_gather'].append(None)
-            results['gather_cpu_config1_attn'].append(None)
+            results['gather_cpu_config4'].append(None)
+            results['gather_cpu_config4_gather'].append(None)
+            results['gather_cpu_config4_attn'].append(None)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-        # Gather Attention CPU Config 2
-        try:
-            print(f"  Gather Attn CPU - Config 2 (page_size={gather_config2['page_size']})... ", end='', flush=True)
-            total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cpu', **gather_config2)
-            results['gather_cpu_config2'].append(total_time)
-            results['gather_cpu_config2_gather'].append(gather_time)
-            results['gather_cpu_config2_attn'].append(attn_time)
-            print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
-        except Exception as e:
-            print(f"FAILED: {e}")
-            results['gather_cpu_config2'].append(None)
-            results['gather_cpu_config2_gather'].append(None)
-            results['gather_cpu_config2_attn'].append(None)
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-        # Gather Attention CUDA Config 1
-        try:
-            print(f"  Gather Attn CUDA - Config 1 (page_size={gather_config1['page_size']})... ", end='', flush=True)
-            total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cuda', **gather_config1)
-            results['gather_cuda_config1'].append(total_time)
-            results['gather_cuda_config1_gather'].append(gather_time)
-            results['gather_cuda_config1_attn'].append(attn_time)
-            print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
-        except Exception as e:
-            print(f"FAILED: {e}")
-            results['gather_cuda_config1'].append(None)
-            results['gather_cuda_config1_gather'].append(None)
-            results['gather_cuda_config1_attn'].append(None)
-
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-        # Gather Attention CUDA Config 2
-        try:
-            print(f"  Gather Attn CUDA - Config 2 (page_size={gather_config2['page_size']})... ", end='', flush=True)
-            total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cuda', **gather_config2)
-            results['gather_cuda_config2'].append(total_time)
-            results['gather_cuda_config2_gather'].append(gather_time)
-            results['gather_cuda_config2_attn'].append(attn_time)
-            print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
-        except Exception as e:
-            print(f"FAILED: {e}")
-            results['gather_cuda_config2'].append(None)
-            results['gather_cuda_config2_gather'].append(None)
-            results['gather_cuda_config2_attn'].append(None)
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-        # FlashInfer CPU Config 3
-        try:
-            print(f"  FlashInfer CPU - Config 3 (mixed)... ", end='', flush=True)
-            time_val = profile_flashinfer_mixed(batch_size=batch_size, device='cpu', **flashinfer_config3)
-            results['flashinfer_cpu_config3'].append(time_val)
-            print(f"{time_val:.2f} ms")
-        except Exception as e:
-            print(f"FAILED: {e}")
-            results['flashinfer_cpu_config3'].append(None)
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-        # FlashInfer CUDA Config 3
-        try:
-            print(f"  FlashInfer CUDA - Config 3 (mixed)... ", end='', flush=True)
-            time_val = profile_flashinfer_mixed(batch_size=batch_size, device='cuda', **flashinfer_config3)
-            results['flashinfer_cuda_config3'].append(time_val)
-            print(f"{time_val:.2f} ms")
-        except Exception as e:
-            print(f"FAILED: {e}")
-            results['flashinfer_cuda_config3'].append(None)
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-        # Gather Attention CPU Config 3
-        try:
-            print(f"  Gather Attn CPU - Config 3 (mixed)... ", end='', flush=True)
-            total_time, gather_time, attn_time = profile_gather_attention_mixed(batch_size=batch_size, device='cpu', **gather_config3)
-            results['gather_cpu_config3'].append(total_time)
-            results['gather_cpu_config3_gather'].append(gather_time)
-            results['gather_cpu_config3_attn'].append(attn_time)
-            print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
-        except Exception as e:
-            print(f"FAILED: {e}")
-            results['gather_cpu_config3'].append(None)
-            results['gather_cpu_config3_gather'].append(None)
-            results['gather_cpu_config3_attn'].append(None)
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-        # Gather Attention CUDA Config 3
-        try:
-            print(f"  Gather Attn CUDA - Config 3 (mixed)... ", end='', flush=True)
-            total_time, gather_time, attn_time = profile_gather_attention_mixed(batch_size=batch_size, device='cuda', **gather_config3)
-            results['gather_cuda_config3'].append(total_time)
-            results['gather_cuda_config3_gather'].append(gather_time)
-            results['gather_cuda_config3_attn'].append(attn_time)
-            print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
-        except Exception as e:
-            print(f"FAILED: {e}")
-            results['gather_cuda_config3'].append(None)
-            results['gather_cuda_config3_gather'].append(None)
-            results['gather_cuda_config3_attn'].append(None)
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-    # Create 6 figures - one for each device/config combination
-    # Each figure compares FlashInfer vs Gather Attention
+    # Create a single figure comparing all three cache baselines
     print("\n" + "=" * 80)
-    print("Generating comparison plots...")
+    print("Generating comparison plot...")
     print("=" * 80)
 
-    plot_configs = [
-        # (flashinfer_key, gather_key, gather_gather_key, gather_attn_key, title, filename)
-        ('flashinfer_cpu_config1', 'gather_cpu_config1', 'gather_cpu_config1_gather', 'gather_cpu_config1_attn',
-         'CPU - Config 1 (page_size=8): FlashInfer vs Gather Attention', 'cpu_config1_comparison.png'),
-        ('flashinfer_cpu_config2', 'gather_cpu_config2', 'gather_cpu_config2_gather', 'gather_cpu_config2_attn',
-         'CPU - Config 2 (page_size=1): FlashInfer vs Gather Attention', 'cpu_config2_comparison.png'),
-        ('flashinfer_cpu_config3', 'gather_cpu_config3', 'gather_cpu_config3_gather', 'gather_cpu_config3_attn',
-         'CPU - Config 3 (mixed): FlashInfer vs Gather Attention', 'cpu_config3_comparison.png'),
-        ('flashinfer_cuda_config1', 'gather_cuda_config1', 'gather_cuda_config1_gather', 'gather_cuda_config1_attn',
-         'CUDA - Config 1 (page_size=8): FlashInfer vs Gather Attention', 'cuda_config1_comparison.png'),
-        ('flashinfer_cuda_config2', 'gather_cuda_config2', 'gather_cuda_config2_gather', 'gather_cuda_config2_attn',
-         'CUDA - Config 2 (page_size=1): FlashInfer vs Gather Attention', 'cuda_config2_comparison.png'),
-        ('flashinfer_cuda_config3', 'gather_cuda_config3', 'gather_cuda_config3_gather', 'gather_cuda_config3_attn',
-         'CUDA - Config 3 (mixed): FlashInfer vs Gather Attention', 'cuda_config3_comparison.png'),
-    ]
+    fig, ax = plt.subplots(figsize=(16, 8))
 
-    for fi_key, ga_key, ga_gather_key, ga_attn_key, title, filename in plot_configs:
-        fig = plt.figure(figsize=(12, 7))
+    # Prepare data for stacked bar chart
+    x = np.arange(len(batch_sizes))  # Label locations
+    width = 0.25  # Width of bars
 
-        # Plot FlashInfer
-        fi_data = results[fi_key]
-        valid_fi = [(bs, val) for bs, val in zip(batch_sizes, fi_data) if val is not None]
-        if valid_fi:
-            bs_vals, time_vals = zip(*valid_fi)
-            plt.plot(bs_vals, time_vals, marker='o', linestyle='-', linewidth=3,
-                    markersize=10, label='FlashInfer', color='C0')
+    # Extract data for all three baselines
+    fi_gather = [results['config4_cpu_gather'][i] if results['config4_cpu_gather'][i] is not None else 0 for i in range(len(batch_sizes))]
+    fi_flashinfer = [results['config4_cpu_flashinfer'][i] if results['config4_cpu_flashinfer'][i] is not None else 0 for i in range(len(batch_sizes))]
 
-        # Plot Gather Attention - Total
-        ga_data = results[ga_key]
-        valid_ga = [(bs, val) for bs, val in zip(batch_sizes, ga_data) if val is not None]
-        if valid_ga:
-            bs_vals, time_vals = zip(*valid_ga)
-            plt.plot(bs_vals, time_vals, marker='s', linestyle='-', linewidth=3,
-                    markersize=10, label='Gather Attn (Total)', color='C1')
+    mixed2_gather = [results['config4_cpu_mixed2_gather'][i] if results['config4_cpu_mixed2_gather'][i] is not None else 0 for i in range(len(batch_sizes))]
+    mixed2_flashinfer = [results['config4_cpu_mixed2_flashinfer'][i] if results['config4_cpu_mixed2_flashinfer'][i] is not None else 0 for i in range(len(batch_sizes))]
 
-        # Plot Gather Attention - Gather component
-        ga_gather_data = results[ga_gather_key]
-        valid_ga_gather = [(bs, val) for bs, val in zip(batch_sizes, ga_gather_data) if val is not None]
-        if valid_ga_gather:
-            bs_vals, time_vals = zip(*valid_ga_gather)
-            plt.plot(bs_vals, time_vals, marker='s', linestyle='--', linewidth=2.5,
-                    markersize=8, label='Gather Attn (Gather)', color='C2', alpha=0.8)
+    ga_gather = [results['gather_cpu_config4_gather'][i] if results['gather_cpu_config4_gather'][i] is not None else 0 for i in range(len(batch_sizes))]
+    ga_attn = [results['gather_cpu_config4_attn'][i] if results['gather_cpu_config4_attn'][i] is not None else 0 for i in range(len(batch_sizes))]
 
-        # Plot Gather Attention - Attention component
-        ga_attn_data = results[ga_attn_key]
-        valid_ga_attn = [(bs, val) for bs, val in zip(batch_sizes, ga_attn_data) if val is not None]
-        if valid_ga_attn:
-            bs_vals, time_vals = zip(*valid_ga_attn)
-            plt.plot(bs_vals, time_vals, marker='^', linestyle='--', linewidth=2.5,
-                    markersize=8, label='Gather Attn (Attention)', color='C3', alpha=0.8)
+    # Create stacked bars for each baseline
+    # FlashInfer Mixed: Gather+Attn at bottom, FlashInfer on top
+    ax.bar(x - width, fi_gather, width, label='FlashInfer Mixed (Gather+Attn)', color='#1f77b4', alpha=0.8)
+    ax.bar(x - width, fi_flashinfer, width, bottom=fi_gather, label='FlashInfer Mixed (FlashInfer)', color='#aec7e8', alpha=0.8)
 
-        plt.xlabel('Batch Size', fontsize=14, fontweight='bold')
-        plt.ylabel('Execution Time (ms)', fontsize=14, fontweight='bold')
-        plt.title(title, fontsize=16, fontweight='bold')
-        plt.legend(fontsize=11, loc='best')
-        plt.grid(True, alpha=0.3, linestyle='--')
-        plt.xticks(batch_sizes)
-        plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"  Saved: {filename}")
-        plt.close(fig)
+    # Mixed2: Gather+Attn at bottom, FlashInfer on top
+    ax.bar(x, mixed2_gather, width, label='Mixed2 (Gather+Attn)', color='#ff7f0e', alpha=0.8)
+    ax.bar(x, mixed2_flashinfer, width, bottom=mixed2_gather, label='Mixed2 (FlashInfer)', color='#ffbb78', alpha=0.8)
+
+    # Gather Attention: Gather at bottom, Attention on top
+    ax.bar(x + width, ga_gather, width, label='Gather Attn (Gather)', color='#2ca02c', alpha=0.8)
+    ax.bar(x + width, ga_attn, width, bottom=ga_gather, label='Gather Attn (Attention)', color='#98df8a', alpha=0.8)
+
+    ax.set_xlabel('Batch Size', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Execution Time (ms)', fontsize=14, fontweight='bold')
+    ax.set_title('CPU - Config 4 (mixed+cache): All Three Cache Baselines Comparison', fontsize=16, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(batch_sizes)
+    ax.legend(fontsize=9, loc='best', ncol=3)
+    ax.grid(True, alpha=0.3, linestyle='--', axis='y')
+    plt.tight_layout()
+    plt.savefig('cpu_config4_all_baselines_comparison.png', dpi=300, bbox_inches='tight')
+    print(f"  Saved: cpu_config4_all_baselines_comparison.png")
+    plt.close(fig)
 
     print("=" * 80)
-    print("All comparison plots saved!")
+    print("Comparison plot saved!")
 
     # All configs for reference
     all_configs = [

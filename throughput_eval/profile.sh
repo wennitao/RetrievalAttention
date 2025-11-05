@@ -1,1 +1,2 @@
 nsys profile -w true -t cuda,nvtx,osrt,cudnn,cublas,openmp -s process-tree --backtrace=fp --cudabacktrace=all --gpu-metrics-devices=all --cuda-memory-usage=true -x true -f true -o retroinfer-10 python test.py --context_len 120000 --attn_type RetroInfer --model_name meta-llama/Llama-3.1-8B-Instruct --task_name NIAH
+sudo /usr/local/cuda-12.6/bin/ncu --set full -f -o gather /mnt/conda/w2ni/miniconda3/envs/retroinfer/bin/python profiling.py
