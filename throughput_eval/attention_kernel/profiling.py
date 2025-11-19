@@ -787,7 +787,7 @@ def profile_gather_attention_mixed_cache(
     
     end = time.perf_counter()
     total_time = end - start
-    print(f"Gather Time: {gather_total / 10 * 1000:.2f} ms, Attention Time: {attention_total /10 * 1000:.2f} ms")
+    # print(f"Gather Time: {gather_total / 10 * 1000:.2f} ms, Attention Time: {attention_total /10 * 1000:.2f} ms")
     # print(f"Gather Attention Kernel Time: {total_time / 10 * 1000:.2f} ms")
     return total_time / 10 * 1000, gather_total / 10 * 1000, attention_total /10 * 1000
 
@@ -1027,26 +1027,26 @@ def profile_mixed_cache(
 
     start = time.perf_counter()
     for it in range(10):
-        # with torch.cuda.stream(gather_stream):
-        #     gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
-        #                     steady_zone_values, list_values, cache_values, execution_buffer_values,
-        #                     miss_unit_idices, miss_unit_sizes, miss_unit_sizes_cumsum, miss_num_units,
-        #                     hit_unit_idices, hit_unit_sizes, hit_unit_sizes_cumsum, hit_num_units,
-        #                     valid_lengths, batch_groups, 
-        #                     static_stride, list_stride, cache_stride,
-        #                     execution_stride, buffer_size, static_len)
-
-        start_gather = time.perf_counter()
-        gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
+        with torch.cuda.stream(gather_stream):
+            gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
                             steady_zone_values, list_values, cache_values, execution_buffer_values,
                             miss_unit_idices, miss_unit_sizes, miss_unit_sizes_cumsum, miss_num_units,
                             hit_unit_idices, hit_unit_sizes, hit_unit_sizes_cumsum, hit_num_units,
                             valid_lengths, batch_groups, 
                             static_stride, list_stride, cache_stride,
                             execution_stride, buffer_size, static_len)
-        torch.cuda.current_stream().synchronize()
-        end_gather = time.perf_counter()
-        gather_total += end_gather - start_gather
+
+        # start_gather = time.perf_counter()
+        # gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
+        #                     steady_zone_values, list_values, cache_values, execution_buffer_values,
+        #                     miss_unit_idices, miss_unit_sizes, miss_unit_sizes_cumsum, miss_num_units,
+        #                     hit_unit_idices, hit_unit_sizes, hit_unit_sizes_cumsum, hit_num_units,
+        #                     valid_lengths, batch_groups, 
+        #                     static_stride, list_stride, cache_stride,
+        #                     execution_stride, buffer_size, static_len)
+        # torch.cuda.current_stream().synchronize()
+        # end_gather = time.perf_counter()
+        # gather_total += end_gather - start_gather
 
         # flashinfer full pages
         start_flashinfer = time.perf_counter()
@@ -1093,7 +1093,7 @@ def profile_mixed_cache(
     end = time.perf_counter()
     total_time = end - start
     # print(f"Gather + Attention Time: {gather_attention_total / 10 * 1000:.2f} ms, FlashInfer Time: {flashinfer_total /10 * 1000:.2f} ms")
-    print(f"Gather Time: {gather_total / 10 * 1000:.2f} ms")
+    # print(f"Gather Time: {gather_total / 10 * 1000:.2f} ms")
     # print(f"Mixed Attention Kernel Time: {total_time / 10 * 1000:.2f} ms")
     return total_time / 10 * 1000, gather_attention_total / 10 * 1000, flashinfer_total / 10 * 1000
     
@@ -1392,26 +1392,26 @@ def profile_mixed2_cache(
 
     start = time.perf_counter()
     for it in range(10):
-        # with torch.cuda.stream(gather_stream):
-        #     gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
-        #                     steady_zone_values, list_values, cache_values, execution_buffer_values,
-        #                     miss_unit_idices, miss_unit_sizes, miss_unit_sizes_cumsum, miss_num_units,
-        #                     hit_unit_idices, hit_unit_sizes, hit_unit_sizes_cumsum, hit_num_units,
-        #                     valid_lengths, batch_groups, 
-        #                     static_stride, list_stride, cache_stride,
-        #                     execution_stride, buffer_size, static_len)
-
-        start_gather = time.perf_counter()
-        gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
+        with torch.cuda.stream(gather_stream):
+            gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
                             steady_zone_values, list_values, cache_values, execution_buffer_values,
                             miss_unit_idices, miss_unit_sizes, miss_unit_sizes_cumsum, miss_num_units,
                             hit_unit_idices, hit_unit_sizes, hit_unit_sizes_cumsum, hit_num_units,
                             valid_lengths, batch_groups, 
                             static_stride, list_stride, cache_stride,
                             execution_stride, buffer_size, static_len)
-        torch.cuda.current_stream().synchronize()
-        end_gather = time.perf_counter()
-        gather_total += end_gather - start_gather
+
+        # start_gather = time.perf_counter()
+        # gather_copy_and_concat(steady_zone_keys, list_keys, cache_keys, execution_buffer_keys,
+        #                     steady_zone_values, list_values, cache_values, execution_buffer_values,
+        #                     miss_unit_idices, miss_unit_sizes, miss_unit_sizes_cumsum, miss_num_units,
+        #                     hit_unit_idices, hit_unit_sizes, hit_unit_sizes_cumsum, hit_num_units,
+        #                     valid_lengths, batch_groups, 
+        #                     static_stride, list_stride, cache_stride,
+        #                     execution_stride, buffer_size, static_len)
+        # torch.cuda.current_stream().synchronize()
+        # end_gather = time.perf_counter()
+        # gather_total += end_gather - start_gather
 
         # flashinfer full pages
         start_flashinfer = time.perf_counter()
@@ -1476,7 +1476,7 @@ def profile_mixed2_cache(
     end = time.perf_counter()
     total_time = end - start
     # print(f"Gather + Attention Time: {gather_attention_total / 10 * 1000:.2f} ms, FlashInfer Time: {flashinfer_total /10 * 1000:.2f} ms")
-    print(f"Gather Time: {gather_total / 10 * 1000:.2f} ms")
+    # print(f"Gather Time: {gather_total / 10 * 1000:.2f} ms")
     # print(f"Mixed Attention Kernel Time: {total_time / 10 * 1000:.2f} ms")
     return total_time / 10 * 1000, gather_attention_total / 10 * 1000, flashinfer_total / 10 * 1000
 
@@ -1500,9 +1500,9 @@ if __name__ == "__main__":
 
     # scatter tokens
     # avg_time = profile_flashinfer(
-    #     num_pages=130000,
-    #     selected_pages=510,
-    #     page_size_full=8,
+    #     num_pages=128000,
+    #     selected_pages=512,
+    #     page_size_full=1,
     #     page_size=1,
     #     batch_size=1,
     #     kv_head=8,
@@ -1577,61 +1577,61 @@ if __name__ == "__main__":
     # torch.cuda.empty_cache()
 
     # gather attention - mixed pages with cache
-    profile_gather_attention_mixed_cache(
-        n_centroids=7680,
-        nprobe=138,
-        cache_cluster_num=414,
-        cache_hit_rate=0.9,
-        num_pages=15300,
-        selected_pages_full=175,
-        page_size_full=8,
-        selected_pages_scatter=510,
-        page_size_scatter=1,
-        batch_size=32,
-        kv_head=8,
-        head_dim=128,
-        dtype=torch.bfloat16,
-        device='cpu',
-    )
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
+    # profile_gather_attention_mixed_cache(
+    #     n_centroids=7680,
+    #     nprobe=138,
+    #     cache_cluster_num=414,
+    #     cache_hit_rate=0.9,
+    #     num_pages=15300,
+    #     selected_pages_full=175,
+    #     page_size_full=8,
+    #     selected_pages_scatter=510,
+    #     page_size_scatter=1,
+    #     batch_size=32,
+    #     kv_head=8,
+    #     head_dim=128,
+    #     dtype=torch.bfloat16,
+    #     device='cpu',
+    # )
+    # torch.cuda.synchronize()
+    # torch.cuda.empty_cache()
 
     # mixed attention
-    profile_mixed_cache(
-        n_centroids=7680,
-        nprobe=138,
-        cache_cluster_num=414,
-        cache_hit_rate=0.9,
-        num_pages=15300,
-        selected_pages_full=175,
-        page_size_full=8,
-        selected_pages_scatter=510,
-        page_size_scatter=1,
-        batch_size=32,
-        kv_head=8,
-        head_dim=128,
-        dtype=torch.bfloat16,
-        device='cpu',
-    )
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
+    # profile_mixed_cache(
+    #     n_centroids=7680,
+    #     nprobe=138,
+    #     cache_cluster_num=414,
+    #     cache_hit_rate=0.9,
+    #     num_pages=15300,
+    #     selected_pages_full=175,
+    #     page_size_full=8,
+    #     selected_pages_scatter=510,
+    #     page_size_scatter=1,
+    #     batch_size=8,
+    #     kv_head=8,
+    #     head_dim=128,
+    #     dtype=torch.bfloat16,
+    #     device='cpu',
+    # )
+    # torch.cuda.synchronize()
+    # torch.cuda.empty_cache()
 
     # mixed2 attention
-    profile_mixed2_cache(
-        n_centroids=7680,
-        nprobe=138,
-        cache_cluster_num=414,
-        cache_hit_rate=0.9,
-        num_pages=15300,
-        selected_pages_full=175,
-        page_size_full=8,
-        selected_pages_scatter=510,
-        page_size_scatter=1,
-        batch_size=32,
-        kv_head=8,
-        head_dim=128,
-        dtype=torch.bfloat16,
-        device='cpu',
-    )
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
+    # profile_mixed2_cache(
+    #     n_centroids=7680,
+    #     nprobe=138,
+    #     cache_cluster_num=414,
+    #     cache_hit_rate=0.9,
+    #     num_pages=15300,
+    #     selected_pages_full=175,
+    #     page_size_full=8,
+    #     selected_pages_scatter=510,
+    #     page_size_scatter=1,
+    #     batch_size=32,
+    #     kv_head=8,
+    #     head_dim=128,
+    #     dtype=torch.bfloat16,
+    #     device='cpu',
+    # )
+    # torch.cuda.synchronize()
+    # torch.cuda.empty_cache()

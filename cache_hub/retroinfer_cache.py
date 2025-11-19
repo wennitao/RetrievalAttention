@@ -876,13 +876,13 @@ class retroinfer_cache(KV_Cache):
             # print ("hit ", torch.sum (self.hit_unit_sizes[layer_idx], dim=1))
             # print ("miss ", torch.sum (self.miss_unit_sizes[layer_idx], dim=1))
             # print("Layer ", layer_idx, " gather copy and concat:")
-            print(self.miss_unit_idices[layer_idx])
-            print(self.miss_unit_sizes[layer_idx])
-            print(self.miss_num_units[layer_idx])
+            # print(self.miss_unit_idices[layer_idx])
+            # print(self.miss_unit_sizes[layer_idx])
+            # print(self.miss_num_units[layer_idx])
 
-            print(self.hit_unit_idices[layer_idx])
-            print(self.hit_unit_sizes[layer_idx])
-            print(self.hit_num_units[layer_idx])
+            # print(self.hit_unit_idices[layer_idx])
+            # print(self.hit_unit_sizes[layer_idx])
+            # print(self.hit_num_units[layer_idx])
 
             torch.cuda.nvtx.range_push("current_layer_copy")
             gather_copy_and_concat(self.steady_zone_keys[layer_idx], self.list_keys[layer_idx], self.cache_keys[layer_idx], self.execution_buffer_keys[buffer_idx],

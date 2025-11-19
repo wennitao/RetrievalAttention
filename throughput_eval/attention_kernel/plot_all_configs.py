@@ -1,6 +1,8 @@
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
+import json
+from datetime import datetime
 
 # Import profiling functions from profiling.py
 from profiling import (
@@ -85,13 +87,13 @@ def main():
 
     # FlashInfer Configuration 4: mixed pages with cache
     flashinfer_config4 = {
-        'n_centroids': 7680,
-        'nprobe': 138,
-        'cache_cluster_num': 414,
+        'n_centroids': 3840,
+        'nprobe': 69,
+        'cache_cluster_num': 207,
         'cache_hit_rate': 0.9,
-        'num_pages': 15300,
-        'selected_pages_full': 175,
-        'page_size_full': 8,
+        'num_pages': 7650,
+        'selected_pages_full': 88,
+        'page_size_full': 16,
         'selected_pages_scatter': 510,
         'page_size_scatter': 1,
         'kv_head': 8,
@@ -101,13 +103,13 @@ def main():
 
     # Gather Attention Configuration 4: mixed pages with cache
     gather_config4 = {
-        'n_centroids': 7680,
-        'nprobe': 138,
-        'cache_cluster_num': 414,
+        'n_centroids': 3840,
+        'nprobe': 69,
+        'cache_cluster_num': 207,
         'cache_hit_rate': 0.9,
-        'num_pages': 15300,
-        'selected_pages_full': 175,
-        'page_size_full': 8,
+        'num_pages': 7650,
+        'selected_pages_full': 88,
+        'page_size_full': 16,
         'selected_pages_scatter': 510,
         'page_size_scatter': 1,
         'kv_head': 8,
@@ -171,174 +173,174 @@ def main():
         print(f"\nBatch size: {batch_size}")
         print("-" * 80)
 
-        # # FlashInfer CPU Config 1
-        # try:
-        #     print(f"  FlashInfer CPU - Config 1 (page_size={flashinfer_config1['page_size']})... ", end='', flush=True)
-        #     time_val = profile_flashinfer(batch_size=batch_size, device='cpu', **flashinfer_config1)
-        #     results['flashinfer_cpu_config1'].append(time_val)
-        #     print(f"{time_val:.2f} ms")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['flashinfer_cpu_config1'].append(None)
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        # FlashInfer CPU Config 1
+        try:
+            print(f"  FlashInfer CPU - Config 1 (page_size={flashinfer_config1['page_size']})... ", end='', flush=True)
+            time_val = profile_flashinfer(batch_size=batch_size, device='cpu', **flashinfer_config1)
+            results['flashinfer_cpu_config1'].append(time_val)
+            print(f"{time_val:.2f} ms")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['flashinfer_cpu_config1'].append(None)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # # FlashInfer CPU Config 2
-        # try:
-        #     print(f"  FlashInfer CPU - Config 2 (page_size={flashinfer_config2['page_size']})... ", end='', flush=True)
-        #     time_val = profile_flashinfer(batch_size=batch_size, device='cpu', **flashinfer_config2)
-        #     results['flashinfer_cpu_config2'].append(time_val)
-        #     print(f"{time_val:.2f} ms")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['flashinfer_cpu_config2'].append(None)
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        # FlashInfer CPU Config 2
+        try:
+            print(f"  FlashInfer CPU - Config 2 (page_size={flashinfer_config2['page_size']})... ", end='', flush=True)
+            time_val = profile_flashinfer(batch_size=batch_size, device='cpu', **flashinfer_config2)
+            results['flashinfer_cpu_config2'].append(time_val)
+            print(f"{time_val:.2f} ms")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['flashinfer_cpu_config2'].append(None)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # # FlashInfer CUDA Config 1
-        # try:
-        #     print(f"  FlashInfer CUDA - Config 1 (page_size={flashinfer_config1['page_size']})... ", end='', flush=True)
-        #     time_val = profile_flashinfer(batch_size=batch_size, device='cuda', **flashinfer_config1)
-        #     results['flashinfer_cuda_config1'].append(time_val)
-        #     print(f"{time_val:.2f} ms")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['flashinfer_cuda_config1'].append(None)
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        # FlashInfer CUDA Config 1
+        try:
+            print(f"  FlashInfer CUDA - Config 1 (page_size={flashinfer_config1['page_size']})... ", end='', flush=True)
+            time_val = profile_flashinfer(batch_size=batch_size, device='cuda', **flashinfer_config1)
+            results['flashinfer_cuda_config1'].append(time_val)
+            print(f"{time_val:.2f} ms")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['flashinfer_cuda_config1'].append(None)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # # FlashInfer CUDA Config 2
-        # try:
-        #     print(f"  FlashInfer CUDA - Config 2 (page_size={flashinfer_config2['page_size']})... ", end='', flush=True)
-        #     time_val = profile_flashinfer(batch_size=batch_size, device='cuda', **flashinfer_config2)
-        #     results['flashinfer_cuda_config2'].append(time_val)
-        #     print(f"{time_val:.2f} ms")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['flashinfer_cuda_config2'].append(None)
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        # FlashInfer CUDA Config 2
+        try:
+            print(f"  FlashInfer CUDA - Config 2 (page_size={flashinfer_config2['page_size']})... ", end='', flush=True)
+            time_val = profile_flashinfer(batch_size=batch_size, device='cuda', **flashinfer_config2)
+            results['flashinfer_cuda_config2'].append(time_val)
+            print(f"{time_val:.2f} ms")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['flashinfer_cuda_config2'].append(None)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # # Gather Attention CPU Config 1
-        # try:
-        #     print(f"  Gather Attn CPU - Config 1 (page_size={gather_config1['page_size']})... ", end='', flush=True)
-        #     total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cpu', **gather_config1)
-        #     results['gather_cpu_config1'].append(total_time)
-        #     results['gather_cpu_config1_gather'].append(gather_time)
-        #     results['gather_cpu_config1_attn'].append(attn_time)
-        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['gather_cpu_config1'].append(None)
-        #     results['gather_cpu_config1_gather'].append(None)
-        #     results['gather_cpu_config1_attn'].append(None)
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        # Gather Attention CPU Config 1
+        try:
+            print(f"  Gather Attn CPU - Config 1 (page_size={gather_config1['page_size']})... ", end='', flush=True)
+            total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cpu', **gather_config1)
+            results['gather_cpu_config1'].append(total_time)
+            results['gather_cpu_config1_gather'].append(gather_time)
+            results['gather_cpu_config1_attn'].append(attn_time)
+            print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['gather_cpu_config1'].append(None)
+            results['gather_cpu_config1_gather'].append(None)
+            results['gather_cpu_config1_attn'].append(None)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # # Gather Attention CPU Config 2
-        # try:
-        #     print(f"  Gather Attn CPU - Config 2 (page_size={gather_config2['page_size']})... ", end='', flush=True)
-        #     total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cpu', **gather_config2)
-        #     results['gather_cpu_config2'].append(total_time)
-        #     results['gather_cpu_config2_gather'].append(gather_time)
-        #     results['gather_cpu_config2_attn'].append(attn_time)
-        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['gather_cpu_config2'].append(None)
-        #     results['gather_cpu_config2_gather'].append(None)
-        #     results['gather_cpu_config2_attn'].append(None)
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        # Gather Attention CPU Config 2
+        try:
+            print(f"  Gather Attn CPU - Config 2 (page_size={gather_config2['page_size']})... ", end='', flush=True)
+            total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cpu', **gather_config2)
+            results['gather_cpu_config2'].append(total_time)
+            results['gather_cpu_config2_gather'].append(gather_time)
+            results['gather_cpu_config2_attn'].append(attn_time)
+            print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['gather_cpu_config2'].append(None)
+            results['gather_cpu_config2_gather'].append(None)
+            results['gather_cpu_config2_attn'].append(None)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # # Gather Attention CUDA Config 1
-        # try:
-        #     print(f"  Gather Attn CUDA - Config 1 (page_size={gather_config1['page_size']})... ", end='', flush=True)
-        #     total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cuda', **gather_config1)
-        #     results['gather_cuda_config1'].append(total_time)
-        #     results['gather_cuda_config1_gather'].append(gather_time)
-        #     results['gather_cuda_config1_attn'].append(attn_time)
-        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['gather_cuda_config1'].append(None)
-        #     results['gather_cuda_config1_gather'].append(None)
-        #     results['gather_cuda_config1_attn'].append(None)
+        # Gather Attention CUDA Config 1
+        try:
+            print(f"  Gather Attn CUDA - Config 1 (page_size={gather_config1['page_size']})... ", end='', flush=True)
+            total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cuda', **gather_config1)
+            results['gather_cuda_config1'].append(total_time)
+            results['gather_cuda_config1_gather'].append(gather_time)
+            results['gather_cuda_config1_attn'].append(attn_time)
+            print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['gather_cuda_config1'].append(None)
+            results['gather_cuda_config1_gather'].append(None)
+            results['gather_cuda_config1_attn'].append(None)
 
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # # Gather Attention CUDA Config 2
-        # try:
-        #     print(f"  Gather Attn CUDA - Config 2 (page_size={gather_config2['page_size']})... ", end='', flush=True)
-        #     total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cuda', **gather_config2)
-        #     results['gather_cuda_config2'].append(total_time)
-        #     results['gather_cuda_config2_gather'].append(gather_time)
-        #     results['gather_cuda_config2_attn'].append(attn_time)
-        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['gather_cuda_config2'].append(None)
-        #     results['gather_cuda_config2_gather'].append(None)
-        #     results['gather_cuda_config2_attn'].append(None)
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        # Gather Attention CUDA Config 2
+        try:
+            print(f"  Gather Attn CUDA - Config 2 (page_size={gather_config2['page_size']})... ", end='', flush=True)
+            total_time, gather_time, attn_time = profile_gather_attention(batch_size=batch_size, device='cuda', **gather_config2)
+            results['gather_cuda_config2'].append(total_time)
+            results['gather_cuda_config2_gather'].append(gather_time)
+            results['gather_cuda_config2_attn'].append(attn_time)
+            print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['gather_cuda_config2'].append(None)
+            results['gather_cuda_config2_gather'].append(None)
+            results['gather_cuda_config2_attn'].append(None)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # # FlashInfer CPU Config 3
-        # try:
-        #     print(f"  FlashInfer CPU - Config 3 (mixed)... ", end='', flush=True)
-        #     time_val = profile_flashinfer_mixed(batch_size=batch_size, device='cpu', **flashinfer_config3)
-        #     results['flashinfer_cpu_config3'].append(time_val)
-        #     print(f"{time_val:.2f} ms")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['flashinfer_cpu_config3'].append(None)
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        # FlashInfer CPU Config 3
+        try:
+            print(f"  FlashInfer CPU - Config 3 (mixed)... ", end='', flush=True)
+            time_val = profile_flashinfer_mixed(batch_size=batch_size, device='cpu', **flashinfer_config3)
+            results['flashinfer_cpu_config3'].append(time_val)
+            print(f"{time_val:.2f} ms")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['flashinfer_cpu_config3'].append(None)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # # FlashInfer CUDA Config 3
-        # try:
-        #     print(f"  FlashInfer CUDA - Config 3 (mixed)... ", end='', flush=True)
-        #     time_val = profile_flashinfer_mixed(batch_size=batch_size, device='cuda', **flashinfer_config3)
-        #     results['flashinfer_cuda_config3'].append(time_val)
-        #     print(f"{time_val:.2f} ms")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['flashinfer_cuda_config3'].append(None)
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        # FlashInfer CUDA Config 3
+        try:
+            print(f"  FlashInfer CUDA - Config 3 (mixed)... ", end='', flush=True)
+            time_val = profile_flashinfer_mixed(batch_size=batch_size, device='cuda', **flashinfer_config3)
+            results['flashinfer_cuda_config3'].append(time_val)
+            print(f"{time_val:.2f} ms")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['flashinfer_cuda_config3'].append(None)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # # Gather Attention CPU Config 3
-        # try:
-        #     print(f"  Gather Attn CPU - Config 3 (mixed)... ", end='', flush=True)
-        #     total_time, gather_time, attn_time = profile_gather_attention_mixed(batch_size=batch_size, device='cpu', **gather_config3)
-        #     results['gather_cpu_config3'].append(total_time)
-        #     results['gather_cpu_config3_gather'].append(gather_time)
-        #     results['gather_cpu_config3_attn'].append(attn_time)
-        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['gather_cpu_config3'].append(None)
-        #     results['gather_cpu_config3_gather'].append(None)
-        #     results['gather_cpu_config3_attn'].append(None)
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        # Gather Attention CPU Config 3
+        try:
+            print(f"  Gather Attn CPU - Config 3 (mixed)... ", end='', flush=True)
+            total_time, gather_time, attn_time = profile_gather_attention_mixed(batch_size=batch_size, device='cpu', **gather_config3)
+            results['gather_cpu_config3'].append(total_time)
+            results['gather_cpu_config3_gather'].append(gather_time)
+            results['gather_cpu_config3_attn'].append(attn_time)
+            print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['gather_cpu_config3'].append(None)
+            results['gather_cpu_config3_gather'].append(None)
+            results['gather_cpu_config3_attn'].append(None)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # # Gather Attention CUDA Config 3
-        # try:
-        #     print(f"  Gather Attn CUDA - Config 3 (mixed)... ", end='', flush=True)
-        #     total_time, gather_time, attn_time = profile_gather_attention_mixed(batch_size=batch_size, device='cuda', **gather_config3)
-        #     results['gather_cuda_config3'].append(total_time)
-        #     results['gather_cuda_config3_gather'].append(gather_time)
-        #     results['gather_cuda_config3_attn'].append(attn_time)
-        #     print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
-        # except Exception as e:
-        #     print(f"FAILED: {e}")
-        #     results['gather_cuda_config3'].append(None)
-        #     results['gather_cuda_config3_gather'].append(None)
-        #     results['gather_cuda_config3_attn'].append(None)
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
+        # Gather Attention CUDA Config 3
+        try:
+            print(f"  Gather Attn CUDA - Config 3 (mixed)... ", end='', flush=True)
+            total_time, gather_time, attn_time = profile_gather_attention_mixed(batch_size=batch_size, device='cuda', **gather_config3)
+            results['gather_cuda_config3'].append(total_time)
+            results['gather_cuda_config3_gather'].append(gather_time)
+            results['gather_cuda_config3_attn'].append(attn_time)
+            print(f"{total_time:.2f} ms (gather: {gather_time:.2f}, attn: {attn_time:.2f})")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            results['gather_cuda_config3'].append(None)
+            results['gather_cuda_config3_gather'].append(None)
+            results['gather_cuda_config3_attn'].append(None)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
         # FlashInfer CPU Config 4 (cache - CPU only)
         try:
@@ -391,6 +393,29 @@ def main():
             results['gather_cpu_config4_attn'].append(None)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+
+    # Save results to JSON file
+    print("\n" + "=" * 80)
+    print("Saving results to JSON...")
+    print("=" * 80)
+
+    json_results = {
+        'metadata': {
+            'timestamp': datetime.now().isoformat(),
+            'batch_sizes': batch_sizes,
+            'configs': {
+                'flashinfer_config4': flashinfer_config4,
+                'gather_config4': gather_config4,
+            }
+        },
+        'results': results
+    }
+
+    json_filename = f'profiling_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+    with open(json_filename, 'w') as f:
+        json.dump(json_results, f, indent=2, default=str)
+
+    print(f"  Saved: {json_filename}")
 
     # Create a single figure comparing all three cache baselines
     print("\n" + "=" * 80)

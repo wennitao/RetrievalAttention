@@ -80,8 +80,8 @@ def generate_config(model_name, context_len, attn_type):
         original_config[attn_type]['n_centroids'] = n_clusters
         original_config[attn_type]['n_segment'] = n_segments
         original_config[attn_type]['nprobe'] = nprobe
-        original_config[attn_type]['cache_cluster_num'] = nprobe * 3
-        original_config[attn_type]['max_compute_cluster_num'] = int(n_clusters / 4)
+        original_config[attn_type]['cache_cluster_num'] = 0
+        original_config[attn_type]['max_compute_cluster_num'] = nprobe
     
     if attn_type != "Full_Flash_Attn":
         print(original_config[attn_type])
@@ -130,7 +130,7 @@ if __name__ == "__main__":
     attention_masks = inputs.attention_mask
 
     input_len = input_ids.shape[1]
-    gen_len = 4
+    gen_len = 256
     max_len = input_len + gen_len
     print(colored(f"Input length: {input_len}", 'yellow'))
 
@@ -148,37 +148,37 @@ if __name__ == "__main__":
     print(result)
 
     # Warm up (3 rounds)
-    # print(colored("Starting warmup (3 rounds)...", 'cyan'))
-    # for iter in range(3):
-    #     out = llm.generate(attention_type=attn_type,
-    #         inputs_ids = input_ids.to(llm.layers[0].device),
-    #         attention_masks = attention_masks.to(llm.layers[0].device),
-    #         max_new_length=gen_len, attn_config=attn_config)
-    #     print(f"Warmup round {iter+1}/3 completed")
+    print(colored("Starting warmup (3 rounds)...", 'cyan'))
+    for iter in range(3):
+        out = llm.generate(attention_type=attn_type,
+            inputs_ids = input_ids.to(llm.layers[0].device),
+            attention_masks = attention_masks.to(llm.layers[0].device),
+            max_new_length=gen_len, attn_config=attn_config)
+        print(f"Warmup round {iter+1}/3 completed")
 
-    # # Clear profiling data after warmup
-    # print(colored("\nClearing profiling data...", 'cyan'))
-    # profiling.select_clusters_time.clear()
-    # profiling.estimation_time.clear()
-    # profiling.gather_time.clear()
-    # profiling.flash_attn_time.clear()
-    # profiling.buffer_access_time.clear()
-    # profiling.buffer_update_time.clear()
-    # profiling.cache_update_time.clear()
-    # profiling.mlp_time.clear()
-    # profiling.attention_time.clear()
-    # profiling.qkv_time.clear()
-    # profiling.plan_time.clear()
+    # Clear profiling data after warmup
+    print(colored("\nClearing profiling data...", 'cyan'))
+    profiling.select_clusters_time.clear()
+    profiling.estimation_time.clear()
+    profiling.gather_time.clear()
+    profiling.flash_attn_time.clear()
+    profiling.buffer_access_time.clear()
+    profiling.buffer_update_time.clear()
+    profiling.cache_update_time.clear()
+    profiling.mlp_time.clear()
+    profiling.attention_time.clear()
+    profiling.qkv_time.clear()
+    profiling.plan_time.clear()
 
-    # # Benchmark (5 rounds for averaging)
-    # print(colored("\nStarting benchmark (5 rounds)...", 'cyan'))
-    # for iter in range(5):
-    #     out = llm.generate(attention_type=attn_type,
-    #         inputs_ids = input_ids.to(llm.layers[0].device),
-    #         attention_masks = attention_masks.to(llm.layers[0].device),
-    #         max_new_length=gen_len, attn_config=attn_config)
-    #     print(f"Benchmark round {iter+1}/5 completed")
+    # Benchmark (5 rounds for averaging)
+    print(colored("\nStarting benchmark (5 rounds)...", 'cyan'))
+    for iter in range(5):
+        out = llm.generate(attention_type=attn_type,
+            inputs_ids = input_ids.to(llm.layers[0].device),
+            attention_masks = attention_masks.to(llm.layers[0].device),
+            max_new_length=gen_len, attn_config=attn_config)
+        print(f"Benchmark round {iter+1}/5 completed")
 
-    # print(colored("\n" + "="*70, 'green'))
-    # print(colored("PROFILING RESULTS (averaged over 5 rounds)", 'green'))
-    # print(colored("="*70 + "\n", 'green'))
+    print(colored("\n" + "="*70, 'green'))
+    print(colored("PROFILING RESULTS (averaged over 5 rounds)", 'green'))
+    print(colored("="*70 + "\n", 'green'))
